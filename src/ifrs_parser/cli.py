@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .metrics import load_metrics
 from .parser import GoogleIFRSPdfParser, IFRSParserConfig
+from .sheets_export import append_result_to_google_sheets
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -61,6 +62,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not delete uploaded PDF from Google Files API after parsing.",
     )
+    parser.add_argument(
+        "--sheets-config",
+        help="Optional path to Google Sheets export config JSON. If set, parsed result is appended to Google Sheets.",
+    )
     return parser
 
 
@@ -89,6 +94,22 @@ def main() -> int:
     output_path = Path(args.out)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    try:
+        sheets_summary = append_result_to_google_sheets(result, args.sheets_config)
+    except Exception as exc:
+        print(f"Warning: failed to append to Google Sheets: {exc}", file=sys.stderr)
+    else:
+        if sheets_summary is not None:
+            status = sheets_summary.get("status")
+            if status == "ok":
+                print(
+                    "Appended to Google Sheets: "
+                    f"{sheets_summary.get('spreadsheet_url')} "
+                    f"(rows: {sheets_summary.get('appended_rows')})"
+                )
+            else:
+                print(f"Google Sheets export status: {status}")
 
     print(f"Saved parsed metrics to {output_path}")
     return 0

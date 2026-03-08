@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -94,6 +95,9 @@ class IFRSParserConfig:
     timeout_sec: int = 300
     poll_interval_sec: float = 2.0
     keep_uploaded_file: bool = False
+    max_retries_on_resource_exhausted: int = 5
+    retry_base_delay_sec: float = 2.0
+    retry_max_delay_sec: float = 30.0
 
 
 class GoogleIFRSPdfParser:
@@ -170,10 +174,7 @@ class GoogleIFRSPdfParser:
 
         prompt = _build_prompt(metrics, period_hint)
         if self._use_files_api:
-            uploaded_file = self._client.files.upload(
-                file=str(source_path),
-                config={"mime_type": "application/pdf"},
-            )
+            uploaded_file = self._upload_pdf_with_retry(source_path)
             try:
                 ready_file = self._wait_for_file(uploaded_file)
                 response = self._generate_response(prompt=prompt, document=ready_file, metrics=metrics)
@@ -198,15 +199,30 @@ class GoogleIFRSPdfParser:
         document: Any,
         metrics: Sequence[MetricDefinition],
     ) -> Any:
-        return self._client.models.generate_content(
-            model=self._config.model,
-            contents=[prompt, document],
-            config={
-                "temperature": 0,
-                "response_mime_type": "application/json",
-                "response_json_schema": _build_response_schema([metric.key for metric in metrics]),
-            },
-        )
+        attempt = 0
+        while True:
+            try:
+                return self._client.models.generate_content(
+                    model=self._config.model,
+                    contents=[prompt, document],
+                    config={
+                        "temperature": 0,
+                        "response_mime_type": "application/json",
+                        "response_json_schema": _build_response_schema([metric.key for metric in metrics]),
+                    },
+                )
+            except Exception as exc:
+                if not _is_resource_exhausted_error(exc):
+                    raise
+                if attempt >= self._config.max_retries_on_resource_exhausted:
+                    raise
+                delay = _retry_delay_seconds(
+                    attempt=attempt,
+                    base=self._config.retry_base_delay_sec,
+                    max_delay=self._config.retry_max_delay_sec,
+                )
+                time.sleep(delay)
+                attempt += 1
 
     def _wait_for_file(self, file_ref: Any) -> Any:
         file_name = getattr(file_ref, "name", None)
@@ -244,6 +260,27 @@ class GoogleIFRSPdfParser:
             )
         return self._types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
 
+    def _upload_pdf_with_retry(self, source_path: Path) -> Any:
+        attempt = 0
+        while True:
+            try:
+                return self._client.files.upload(
+                    file=str(source_path),
+                    config={"mime_type": "application/pdf"},
+                )
+            except Exception as exc:
+                if not _is_resource_exhausted_error(exc):
+                    raise
+                if attempt >= self._config.max_retries_on_resource_exhausted:
+                    raise
+                delay = _retry_delay_seconds(
+                    attempt=attempt,
+                    base=self._config.retry_base_delay_sec,
+                    max_delay=self._config.retry_max_delay_sec,
+                )
+                time.sleep(delay)
+                attempt += 1
+
 
 def _build_prompt(metrics: Sequence[MetricDefinition], period_hint: str | None) -> str:
     metric_lines = [
@@ -259,8 +296,10 @@ def _build_prompt(metrics: Sequence[MetricDefinition], period_hint: str | None) 
             "Rules:",
             "1) Prefer consolidated IFRS statements when both consolidated and standalone data are present.",
             "2) Determine latest reporting period end date in the document and return it as reporting_period_end_date (ISO YYYY-MM-DD).",
-            "3) Return exactly one item per requested metric_key and do not add extra keys.",
-            "4) Only return values for the latest period (matching reporting_period_end_date). Ignore prior/comparative period values.",
+            "3) Return exactly one item per requested metric_key in metrics (latest period) and one item per requested metric_key in comparative_metrics (previous period for the same metric). Do not add extra keys.",
+            "4) For comparative_metrics choose the nearest earlier disclosed period for each metric_key.",
+            "   For P&L/flow metrics use prior comparable duration (for example H1 2024 for H1 2025).",
+            "   For balance-sheet metrics use prior statement-of-financial-position date (often 31 Dec prior year).",
             "5) Do not estimate values. For missing metrics set found=false and include a short note in notes.",
             "6) Put numeric amount into value and indicate scaling in scale_multiplier:",
             "   1 for units, 1000 for thousands, 1000000 for millions, 1000000000 for billions.",
@@ -268,7 +307,7 @@ def _build_prompt(metrics: Sequence[MetricDefinition], period_hint: str | None) 
             "8) confidence must be between 0 and 1.",
             "9) For debt+lease metrics, return the sum of loans/borrowings and lease liabilities for the same horizon.",
             "   If lease liabilities are not separately disclosed for that horizon, use the corresponding 'other' liabilities for that horizon.",
-            "10) For each metric provide period_end_date in ISO YYYY-MM-DD.",
+            "10) For each metric in both arrays provide period_end_date in ISO YYYY-MM-DD.",
             "11) For interest_expense_loans apply strict priority:",
             "    a) 'Процентные расходы - кредиты банков' (or direct bank loan interest expense).",
             "    b) If unavailable, use total 'Процентные расходы' (interest expense).",
@@ -278,6 +317,29 @@ def _build_prompt(metrics: Sequence[MetricDefinition], period_hint: str | None) 
             *metric_lines,
         ]
     )
+
+
+def _metric_item_schema(metric_keys: Sequence[str]) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "metric_key": {"type": "string", "enum": list(metric_keys)},
+            "metric_name": {"type": "string"},
+            "found": {"type": "boolean"},
+            "value": {"type": "number"},
+            "unit": {"type": "string"},
+            "scale_multiplier": {"type": "number"},
+            "period_label": {"type": "string"},
+            "period_end_date": {"type": "string"},
+            "selection_level": {"type": "string"},
+            "statement": {"type": "string"},
+            "page": {"type": "integer"},
+            "evidence": {"type": "string"},
+            "confidence": {"type": "number"},
+            "notes": {"type": "string"},
+        },
+        "required": ["metric_key", "found"],
+    }
 
 
 def _build_response_schema(metric_keys: Sequence[str]) -> dict[str, Any]:
@@ -291,29 +353,14 @@ def _build_response_schema(metric_keys: Sequence[str]) -> dict[str, Any]:
             "notes": {"type": "string"},
             "metrics": {
                 "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "metric_key": {"type": "string", "enum": list(metric_keys)},
-                        "metric_name": {"type": "string"},
-                        "found": {"type": "boolean"},
-                        "value": {"type": "number"},
-                        "unit": {"type": "string"},
-                        "scale_multiplier": {"type": "number"},
-                        "period_label": {"type": "string"},
-                        "period_end_date": {"type": "string"},
-                        "selection_level": {"type": "string"},
-                        "statement": {"type": "string"},
-                        "page": {"type": "integer"},
-                        "evidence": {"type": "string"},
-                        "confidence": {"type": "number"},
-                        "notes": {"type": "string"},
-                    },
-                    "required": ["metric_key", "found"],
-                },
+                "items": _metric_item_schema(metric_keys),
+            },
+            "comparative_metrics": {
+                "type": "array",
+                "items": _metric_item_schema(metric_keys),
             },
         },
-        "required": ["metrics"],
+        "required": ["metrics", "comparative_metrics"],
     }
 
 
@@ -349,45 +396,30 @@ def _normalize_result(
     )
     reporting_currency = _as_string(payload.get("reporting_currency"))
     metric_map = {metric.key: metric for metric in metrics}
-    raw_metrics = payload.get("metrics")
-    if not isinstance(raw_metrics, list):
-        raw_metrics = []
 
-    normalized: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for item in raw_metrics:
-        if not isinstance(item, dict):
-            continue
-        key = _as_string(item.get("metric_key"))
-        if not key or key not in metric_map or key in seen:
-            continue
-        seen.add(key)
-        normalized.append(_normalize_metric(item, metric_map[key]))
-
-    for metric in metrics:
-        if metric.key not in seen:
-            normalized.append(
-                {
-                    "metric_key": metric.key,
-                    "metric_name": metric.name,
-                    "found": False,
-                    "value": None,
-                    "unit": None,
-                    "scale_multiplier": None,
-                    "period_label": None,
-                    "period_end_date": None,
-                    "selection_level": None,
-                    "statement": None,
-                    "page": None,
-                    "evidence": None,
-                    "confidence": None,
-                    "notes": "No value returned by model.",
-                }
-            )
-
+    normalized = _normalize_metric_block(
+        raw_metrics=payload.get("metrics"),
+        metrics=metrics,
+        metric_map=metric_map,
+        missing_note="No value returned by model for latest period.",
+    )
+    if not reporting_period_end_date:
+        reporting_period_end_date = _max_found_period_end_date(normalized)
     _enforce_latest_period_only(normalized, reporting_period_end_date)
     _apply_business_rules(normalized)
+
+    comparative_normalized = _normalize_metric_block(
+        raw_metrics=payload.get("comparative_metrics"),
+        metrics=metrics,
+        metric_map=metric_map,
+        missing_note="No comparative value returned by model.",
+    )
+    _enforce_comparative_period_only(comparative_normalized, reporting_period_end_date)
+    _apply_business_rules(comparative_normalized)
+
     _convert_metrics_to_billion_rub(normalized, reporting_currency)
+    _convert_metrics_to_billion_rub(comparative_normalized, reporting_currency)
+
     missing_metrics = [item["metric_key"] for item in normalized if not item["found"]]
     calculated_metrics = _build_calculated_metrics(
         metrics=normalized,
@@ -406,9 +438,86 @@ def _normalize_result(
         "output_value_unit": TARGET_RUB_BN_UNIT,
         "notes": _as_string(payload.get("notes")),
         "metrics": all_metrics,
+        "primary_metrics": normalized,
+        "comparative_metrics": comparative_normalized,
+        "comparative_period_end_dates": _collect_period_end_dates(comparative_normalized),
         "calculated_metrics": calculated_metrics,
         "missing_metrics": missing_metrics,
     }
+
+
+def _normalize_metric_block(
+    raw_metrics: Any,
+    metrics: Sequence[MetricDefinition],
+    metric_map: dict[str, MetricDefinition],
+    missing_note: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(raw_metrics, list):
+        raw_metrics = []
+
+    normalized_by_key: dict[str, dict[str, Any]] = {}
+    for item in raw_metrics:
+        if not isinstance(item, dict):
+            continue
+        key = _as_string(item.get("metric_key"))
+        if not key or key not in metric_map or key in normalized_by_key:
+            continue
+        normalized_by_key[key] = _normalize_metric(item, metric_map[key])
+
+    normalized: list[dict[str, Any]] = []
+    for metric in metrics:
+        existing = normalized_by_key.get(metric.key)
+        if existing is not None:
+            normalized.append(existing)
+            continue
+        normalized.append(_build_missing_metric(metric, missing_note))
+    return normalized
+
+
+def _build_missing_metric(definition: MetricDefinition, note: str) -> dict[str, Any]:
+    return {
+        "metric_key": definition.key,
+        "metric_name": definition.name,
+        "found": False,
+        "value": None,
+        "unit": None,
+        "scale_multiplier": None,
+        "period_label": None,
+        "period_end_date": None,
+        "selection_level": None,
+        "statement": None,
+        "page": None,
+        "evidence": None,
+        "confidence": None,
+        "notes": note,
+    }
+
+
+def _max_found_period_end_date(metrics: list[dict[str, Any]]) -> str | None:
+    period_dates: list[str] = []
+    for item in metrics:
+        if not item.get("found"):
+            continue
+        period_end = _extract_iso_date(item.get("period_end_date")) or _extract_iso_date(item.get("period_label"))
+        if period_end:
+            period_dates.append(period_end)
+    if not period_dates:
+        return None
+    return max(period_dates)
+
+
+def _collect_period_end_dates(metrics: list[dict[str, Any]]) -> list[str]:
+    periods = sorted(
+        {
+            period_end
+            for item in metrics
+            for period_end in [
+                _extract_iso_date(item.get("period_end_date")) or _extract_iso_date(item.get("period_label"))
+            ]
+            if period_end
+        }
+    )
+    return periods
 
 
 def _normalize_metric(item: dict[str, Any], definition: MetricDefinition) -> dict[str, Any]:
@@ -462,6 +571,31 @@ def _enforce_latest_period_only(
                 item,
                 f"Excluded because metric period ({metric_period_end or 'unknown'}) does not match "
                 f"latest period ({reporting_period_end_date}).",
+            )
+
+
+def _enforce_comparative_period_only(
+    metrics: list[dict[str, Any]],
+    reporting_period_end_date: str | None,
+) -> None:
+    if not reporting_period_end_date:
+        return
+    for item in metrics:
+        if not item.get("found"):
+            continue
+        metric_period_end = _extract_iso_date(item.get("period_end_date")) or _extract_iso_date(
+            item.get("period_label")
+        )
+        if not metric_period_end:
+            _mark_metric_not_found(
+                item,
+                "Comparative period is missing period_end_date.",
+            )
+            continue
+        if metric_period_end == reporting_period_end_date:
+            _mark_metric_not_found(
+                item,
+                f"Comparative period ({metric_period_end}) matches latest period ({reporting_period_end_date}).",
             )
 
 
@@ -900,6 +1034,23 @@ def _file_state_name(file_ref: Any) -> str:
     if isinstance(state_name, str):
         return state_name.upper()
     return str(state).upper()
+
+
+def _is_resource_exhausted_error(exc: Exception) -> bool:
+    text = str(exc).upper()
+    if "RESOURCE_EXHAUSTED" in text:
+        return True
+    if " 429" in text:
+        return True
+    if "CODE: 429" in text:
+        return True
+    return False
+
+
+def _retry_delay_seconds(attempt: int, base: float, max_delay: float) -> float:
+    exp_delay = min(max_delay, base * (2**attempt))
+    jitter = random.uniform(0.0, min(1.0, exp_delay * 0.2))
+    return exp_delay + jitter
 
 
 def _as_string(value: Any) -> str | None:

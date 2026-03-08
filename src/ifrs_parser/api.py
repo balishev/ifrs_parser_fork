@@ -10,6 +10,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
 from .metrics import load_metrics
 from .parser import DEFAULT_LOCATION, DEFAULT_MODEL, GoogleIFRSPdfParser, IFRSParserConfig
+from .sheets_export import append_result_to_google_sheets
 
 app = FastAPI(
     title="IFRS PDF Parser API",
@@ -69,6 +70,8 @@ async def parse_ifrs_pdf(
     period_hint: str | None = Form(default=None),
     model: str = Form(default=DEFAULT_MODEL),
     timeout_sec: int = Form(default=300),
+    write_to_sheets: bool = Form(default=True),
+    sheets_config_path: str | None = Form(default=None),
 ) -> dict[str, Any]:
     filename = (file.filename or "").strip()
     if not filename.lower().endswith(".pdf"):
@@ -87,6 +90,18 @@ async def parse_ifrs_pdf(
             model,
             timeout_sec,
         )
+        if write_to_sheets:
+            try:
+                sheets_summary = await asyncio.to_thread(
+                    append_result_to_google_sheets,
+                    result,
+                    sheets_config_path,
+                )
+            except Exception as exc:
+                result["sheets_export"] = {"status": "error", "error": str(exc)}
+            else:
+                if sheets_summary is not None:
+                    result["sheets_export"] = sheets_summary
         return result
     except HTTPException:
         raise

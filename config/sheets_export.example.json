@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "credentials_json": "/absolute/path/to/service-account.json",
+  "spreadsheet_id": "",
+  "spreadsheet_title": "IFRS Parser Export",
+  "worksheet_name": "Импорт",
+  "create_spreadsheet_if_missing": true,
+  "share_with": [
+    "your-email@company.com"
+  ],
+  "source_label": "МСФО",
+  "type_label": "Source",
+  "default_industry": "",
+  "include_not_found_metrics": false
+}

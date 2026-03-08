@@ -9,7 +9,7 @@ This project extracts a defined set of IFRS financial metrics from a PDF report 
 - Engine: Google AI API (`google-genai` SDK).
 - Metric set: default list in code, or custom list from JSON config.
 - All numeric output values are converted to `RUB bn` (billions of rubles).
-- Only latest reporting period is returned; prior/comparative period values are excluded.
+- Latest period is returned in `metrics`, and previous comparable values are returned in `comparative_metrics`.
 - Additional calculated metrics are added to output based on parsed values.
 
 Default metric set:
@@ -93,6 +93,36 @@ Optional parameters:
 - `--api-key` (if not using env var)
 - `--credentials-json` (service account key path for Vertex mode)
 - `--project` and `--location` (Vertex settings)
+- `--sheets-config` (path to Google Sheets export config)
+
+## Google Sheets Export (one-pager format)
+
+After parsing, result can be appended to Google Sheets in one-pager-like column format:
+
+- `Отрасль`, `Компания`, `Type`, `Показатель`, `Сегмент`, `Сегмент`, `Источник`, `Ед.изм.`, `LTM`, `2025`, `2024`, `2023`, `2022`
+- Period split inside year is supported:
+  - `3M` -> quarter columns (`1Q/2Q/3Q/4Q`)
+  - `6M` -> half-year columns (`1H/2H`)
+  - `9M` -> `3Q`
+  - `12M/FY` -> year columns (`2025/2024/...`)
+
+Setup:
+
+1. Copy config template:
+   ```bash
+   cp config/sheets_export.example.json config/sheets_export.json
+   ```
+2. Fill `credentials_json` and (optionally) `spreadsheet_id`.
+3. Initialize sheet:
+   ```bash
+   ifrs-sheets-init --config config/sheets_export.json
+   ```
+4. Use in parser:
+   ```bash
+   ifrs-parser --pdf /path/to/report.pdf --sheets-config config/sheets_export.json
+   ```
+
+Detailed auth/setup guide: [`docs/google_sheets_setup.md`](docs/google_sheets_setup.md)
 
 ## HTTP API (async, with OpenAPI)
 
@@ -126,7 +156,8 @@ Request example:
 curl -X POST "http://localhost:8000/parse" \
   -F "file=@/path/to/ifrs_report.pdf" \
   -F "period_hint=Q2 2025" \
-  -F "model=gemini-2.5-flash"
+  -F "model=gemini-2.5-flash" \
+  -F "write_to_sheets=true"
 ```
 
 Response: same JSON structure as CLI output (`metrics`, `missing_metrics`, etc.).
@@ -158,6 +189,7 @@ How it works:
 - Send IFRS PDF as a document to the bot.
 - Optional caption: `period_hint=Q2 2025`.
 - Bot parses PDF and sends back CSV with extracted metrics.
+- If the same PDF was already processed before, bot skips parsing and sends company rows from Google Sheets.
 - `/start` sends a welcome message with usage.
 - `/help` asks user to leave feedback (`Ошибка`, `Изменение`, `Вопрос`) in the next text message.
 - Feedback is forwarded to support chat (default id: `780684269`).
@@ -167,6 +199,8 @@ Bot uses the same Google auth env vars as CLI/API:
 - `GOOGLE_API_KEY` or `GEMINI_API_KEY`, or
 - `IFRS_VERTEX_CREDENTIALS_JSON` + `IFRS_VERTEX_PROJECT`
 - Optional: `IFRS_FEEDBACK_CHAT_ID` to override default feedback chat id.
+- Optional: `IFRS_SHEETS_CONFIG_PATH` to auto-append parse result to Google Sheets.
+- Optional: `IFRS_TG_DOC_REGISTRY_PATH` to override local processed-doc registry path.
 
 ## Metrics config format
 
@@ -216,6 +250,24 @@ Output is a JSON object like:
       "page": 45,
       "evidence": "Revenue 123,456",
       "confidence": 0.89,
+      "notes": null
+    }
+  ],
+  "comparative_metrics": [
+    {
+      "metric_key": "revenue",
+      "metric_name": "Revenue",
+      "found": true,
+      "value": 118.001,
+      "unit": "RUB bn",
+      "scale_multiplier": 1.0,
+      "period_label": "6M 2024",
+      "period_end_date": "2024-06-30",
+      "selection_level": "bank_loan_interest",
+      "statement": "Statement of profit or loss",
+      "page": 45,
+      "evidence": "Revenue 118,001",
+      "confidence": 0.86,
       "notes": null
     }
   ],

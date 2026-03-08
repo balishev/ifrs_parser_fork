@@ -10,3 +10,4 @@ ifrs-parser-*.json
 
 *.egg-info/
 tg_token
+config/sheets_export.json

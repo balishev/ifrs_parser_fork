@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
   "google-genai>=1.30.0",
   "google-auth>=2.0.0",
+  "gspread>=6.0.0",
   "openpyxl>=3.1.0",
   "fastapi>=0.115.0",
   "uvicorn>=0.30.0",
@@ -23,6 +24,7 @@ ifrs-parser = "ifrs_parser.cli:main"
 ifrs-compare-excel = "ifrs_parser.compare_excel:main"
 ifrs-api = "ifrs_parser.api:main"
 ifrs-telegram-bot = "ifrs_parser.telegram_bot:main"
+ifrs-sheets-init = "ifrs_parser.sheets_init:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import json
 import logging
 import os
 import re
 import shutil
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 from .metrics import load_metrics
 from .parser import DEFAULT_LOCATION, DEFAULT_MODEL, GoogleIFRSPdfParser, IFRSParserConfig
+from .sheets_export import append_result_to_google_sheets, fetch_company_rows_from_google_sheets
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +27,7 @@ _FILENAME_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _TOKEN_LINE_RE = re.compile(r"^\s*TOKEN\s*=\s*(.+?)\s*$", re.IGNORECASE)
 DEFAULT_FEEDBACK_CHAT_ID = 780684269
 _AWAITING_FEEDBACK_KEY = "awaiting_feedback"
+DEFAULT_DOC_REGISTRY_PATH = Path("output/tg_doc_registry.json")
 _CSV_COLUMNS = [
     "source_document",
     "company_name",
@@ -31,6 +35,7 @@ _CSV_COLUMNS = [
     "reporting_period_end_date",
     "reporting_currency",
     "output_value_unit",
+    "metric_scope",
     "metric_key",
     "metric_name",
     "found",
@@ -44,6 +49,78 @@ _CSV_COLUMNS = [
     "confidence",
     "notes",
 ]
+
+
+def _as_non_empty_str(value: Any) -> str | None:
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    return None
+
+
+def _resolve_registry_path() -> Path:
+    raw = _as_non_empty_str(os.getenv("IFRS_TG_DOC_REGISTRY_PATH"))
+    path = Path(raw) if raw else DEFAULT_DOC_REGISTRY_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _load_registry(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
+def _save_registry(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _document_registry_key(document: Any) -> str | None:
+    file_unique_id = _as_non_empty_str(getattr(document, "file_unique_id", None))
+    if file_unique_id:
+        return file_unique_id
+    file_id = _as_non_empty_str(getattr(document, "file_id", None))
+    return file_id
+
+
+def _update_registry_after_parse(
+    document: Any,
+    result: dict[str, Any],
+    sheets_summary: dict[str, Any] | None,
+) -> None:
+    doc_key = _document_registry_key(document)
+    if not doc_key:
+        return
+
+    path = _resolve_registry_path()
+    payload = _load_registry(path)
+    payload[doc_key] = {
+        "file_name": _as_non_empty_str(getattr(document, "file_name", None)),
+        "file_id": _as_non_empty_str(getattr(document, "file_id", None)),
+        "file_unique_id": _as_non_empty_str(getattr(document, "file_unique_id", None)),
+        "company_name": _as_non_empty_str(result.get("company_name")),
+        "reporting_period_end_date": _as_non_empty_str(result.get("reporting_period_end_date")),
+        "sheets_status": _as_non_empty_str((sheets_summary or {}).get("status")),
+        "spreadsheet_id": _as_non_empty_str((sheets_summary or {}).get("spreadsheet_id")),
+        "worksheet_name": _as_non_empty_str((sheets_summary or {}).get("worksheet_name")),
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    _save_registry(path, payload)
+
+
+def _write_company_rows_csv(headers: list[Any], rows: list[list[Any]], csv_path: Path) -> None:
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as output_file:
+        writer = csv.writer(output_file)
+        if headers:
+            writer.writerow(headers)
+        for row in rows:
+            writer.writerow(row)
 
 
 def _strip_wrapping_quotes(value: str) -> str:
@@ -155,6 +232,7 @@ def _result_to_csv_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
         return [
             {
                 **base,
+                "metric_scope": None,
                 "metric_key": None,
                 "metric_name": None,
                 "found": None,
@@ -174,9 +252,13 @@ def _result_to_csv_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
     for metric in metrics:
         if not isinstance(metric, dict):
             continue
+        metric_scope = "latest"
+        if _as_non_empty_str(metric.get("selection_level")) == "calculated":
+            metric_scope = "calculated_latest"
         rows.append(
             {
                 **base,
+                "metric_scope": metric_scope,
                 "metric_key": metric.get("metric_key"),
                 "metric_name": metric.get("metric_name"),
                 "found": metric.get("found"),
@@ -191,6 +273,30 @@ def _result_to_csv_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
                 "notes": metric.get("notes"),
             }
         )
+
+    comparative_metrics = result.get("comparative_metrics")
+    if isinstance(comparative_metrics, list):
+        for metric in comparative_metrics:
+            if not isinstance(metric, dict):
+                continue
+            rows.append(
+                {
+                    **base,
+                    "metric_scope": "comparative",
+                    "metric_key": metric.get("metric_key"),
+                    "metric_name": metric.get("metric_name"),
+                    "found": metric.get("found"),
+                    "value": metric.get("value"),
+                    "unit": metric.get("unit"),
+                    "period_label": metric.get("period_label"),
+                    "period_end_date": metric.get("period_end_date"),
+                    "selection_level": metric.get("selection_level"),
+                    "statement": metric.get("statement"),
+                    "page": metric.get("page"),
+                    "confidence": metric.get("confidence"),
+                    "notes": metric.get("notes"),
+                }
+            )
     return rows
 
 
@@ -275,6 +381,62 @@ async def handle_pdf_document(update: Update, context: ContextTypes.DEFAULT_TYPE
         f'Принял, анализирую "{display_filename}". Это может занять 1-3 минуты.'
     )
     try:
+        doc_key = _document_registry_key(document)
+        cached_entry: dict[str, Any] | None = None
+        if doc_key:
+            registry = _load_registry(_resolve_registry_path())
+            found_entry = registry.get(doc_key)
+            if isinstance(found_entry, dict):
+                cached_entry = found_entry
+
+        if cached_entry is not None:
+            cached_company = _as_non_empty_str(cached_entry.get("company_name"))
+            if cached_company:
+                await status_message.edit_text(
+                    f'Документ "{display_filename}" уже обрабатывался. '
+                    f'Отправляю данные компании "{cached_company}" из таблицы.'
+                )
+                try:
+                    cached_rows_summary = await asyncio.to_thread(
+                        fetch_company_rows_from_google_sheets,
+                        cached_company,
+                        os.getenv("IFRS_SHEETS_CONFIG_PATH"),
+                    )
+                except Exception as sheets_exc:
+                    logger.exception("Failed to fetch cached company rows from Google Sheets")
+                    await status_message.edit_text(
+                        "Документ уже был обработан, но получить данные из таблицы не удалось. "
+                        f"Запускаю повторный парсинг. Ошибка: {sheets_exc}"
+                    )
+                else:
+                    if (
+                        isinstance(cached_rows_summary, dict)
+                        and cached_rows_summary.get("status") == "ok"
+                        and isinstance(cached_rows_summary.get("rows"), list)
+                        and cached_rows_summary.get("rows")
+                    ):
+                        cached_csv_path = temp_dir / f"{Path(_safe_filename(document.file_name)).stem}_from_sheet.csv"
+                        headers = cached_rows_summary.get("headers")
+                        rows = cached_rows_summary.get("rows")
+                        await asyncio.to_thread(
+                            _write_company_rows_csv,
+                            headers if isinstance(headers, list) else [],
+                            rows,
+                            cached_csv_path,
+                        )
+                        await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+                        with cached_csv_path.open("rb") as csv_file:
+                            await message.reply_document(
+                                document=InputFile(csv_file, filename=cached_csv_path.name),
+                                caption=f'Документ уже был обработан. Данные компании "{cached_company}" из таблицы.',
+                            )
+                        await status_message.edit_text("Готово: отправил данные из таблицы без повторного парсинга.")
+                        return
+                    await status_message.edit_text(
+                        "Документ уже был обработан, но по компании нет строк в таблице. "
+                        "Запускаю повторный парсинг."
+                    )
+
         pdf_path = temp_dir / _safe_filename(document.file_name)
         tg_file = await context.bot.get_file(document.file_id)
         await tg_file.download_to_drive(custom_path=str(pdf_path))
@@ -282,6 +444,24 @@ async def handle_pdf_document(update: Update, context: ContextTypes.DEFAULT_TYPE
         period_hint = _extract_period_hint(message.caption)
         await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
         result = await asyncio.to_thread(_parse_pdf_sync, pdf_path, period_hint)
+
+        sheets_summary: dict[str, Any] | None = None
+        try:
+            sheets_summary = await asyncio.to_thread(
+                append_result_to_google_sheets,
+                result,
+                os.getenv("IFRS_SHEETS_CONFIG_PATH"),
+            )
+        except Exception as sheets_exc:
+            logger.exception("Failed to append parsed result to Google Sheets")
+            sheets_summary = {"status": "error", "error": str(sheets_exc)}
+
+        await asyncio.to_thread(
+            _update_registry_after_parse,
+            document,
+            result,
+            sheets_summary,
+        )
 
         csv_path = temp_dir / f"{pdf_path.stem}_metrics.csv"
         await asyncio.to_thread(_write_result_csv, result, csv_path)
@@ -292,10 +472,28 @@ async def handle_pdf_document(update: Update, context: ContextTypes.DEFAULT_TYPE
                 document=InputFile(csv_file, filename=csv_path.name),
                 caption=_build_done_caption(result),
             )
-        await status_message.edit_text("Парсинг завершен.")
+        if sheets_summary and sheets_summary.get("status") == "ok":
+            spreadsheet_url = sheets_summary.get("spreadsheet_url")
+            await status_message.edit_text(
+                f"Парсинг завершен. Данные добавлены в Google Sheets ({spreadsheet_url})."
+            )
+        elif sheets_summary and sheets_summary.get("status") == "error":
+            await status_message.edit_text(
+                f"Парсинг завершен, но не удалось записать в Google Sheets: {sheets_summary.get('error')}"
+            )
+        else:
+            await status_message.edit_text("Парсинг завершен.")
     except Exception as exc:
         logger.exception("Failed to process PDF from Telegram message")
-        await status_message.edit_text(f"Ошибка парсинга: {exc}")
+        error_text = str(exc)
+        upper_error = error_text.upper()
+        if "RESOURCE_EXHAUSTED" in upper_error or " 429" in upper_error:
+            await status_message.edit_text(
+                "Временная перегрузка API (429 RESOURCE_EXHAUSTED). "
+                "Я уже сделал несколько автоматических попыток. Попробуйте отправить документ чуть позже."
+            )
+        else:
+            await status_message.edit_text(f"Ошибка парсинга: {exc}")
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 

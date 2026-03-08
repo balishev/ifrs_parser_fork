@@ -12,11 +12,17 @@ dependencies = [
   "google-genai>=1.30.0",
   "google-auth>=2.0.0",
   "openpyxl>=3.1.0",
+  "fastapi>=0.115.0",
+  "uvicorn>=0.30.0",
+  "python-multipart>=0.0.9",
+  "python-telegram-bot>=21.0",
 ]
 
 [project.scripts]
 ifrs-parser = "ifrs_parser.cli:main"
 ifrs-compare-excel = "ifrs_parser.compare_excel:main"
+ifrs-api = "ifrs_parser.api:main"
+ifrs-telegram-bot = "ifrs_parser.telegram_bot:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

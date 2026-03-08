@@ -16,6 +16,19 @@ DEFAULT_LOCATION = "us-central1"
 MAX_INLINE_PDF_BYTES = 19 * 1024 * 1024
 DEPRECIATION_KEY = "depreciation"
 PPE_KEY = "property_plant_and_equipment"
+REVENUE_KEY = "revenue"
+INTEREST_EXPENSE_KEY = "interest_expense_loans"
+OPERATING_PROFIT_KEY = "operating_profit"
+LONG_TERM_DEBT_KEY = "long_term_debt_and_lease"
+SHORT_TERM_DEBT_KEY = "short_term_debt_and_lease"
+CASH_KEY = "cash_and_cash_equivalents"
+
+CALC_EBITDA_KEY = "ebitda"
+CALC_EBITDA_MARGIN_KEY = "ebitda_margin_pct"
+CALC_TOTAL_DEBT_KEY = "total_debt"
+CALC_NET_DEBT_KEY = "net_debt"
+CALC_EBITDA_TO_INTEREST_KEY = "ebitda_to_interest_expense"
+CALC_NET_DEBT_TO_EBITDA_LTM_KEY = "net_debt_to_ebitda_ltm"
 TARGET_SCALE_BN = 1_000_000_000.0
 TARGET_RUB_BN_UNIT = "RUB bn"
 _ISO_DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
@@ -376,6 +389,12 @@ def _normalize_result(
     _apply_business_rules(normalized)
     _convert_metrics_to_billion_rub(normalized, reporting_currency)
     missing_metrics = [item["metric_key"] for item in normalized if not item["found"]]
+    calculated_metrics = _build_calculated_metrics(
+        metrics=normalized,
+        reporting_period=reporting_period,
+        reporting_period_end_date=reporting_period_end_date,
+    )
+    all_metrics = [*normalized, *calculated_metrics]
 
     return {
         "source_document": source_document,
@@ -386,7 +405,8 @@ def _normalize_result(
         "reporting_currency": reporting_currency,
         "output_value_unit": TARGET_RUB_BN_UNIT,
         "notes": _as_string(payload.get("notes")),
-        "metrics": normalized,
+        "metrics": all_metrics,
+        "calculated_metrics": calculated_metrics,
         "missing_metrics": missing_metrics,
     }
 
@@ -515,6 +535,284 @@ def _convert_metrics_to_billion_rub(
                 item.get("notes"),
                 "Converted to RUB bn format, but reporting_currency is not RUB.",
             )
+
+
+def _build_calculated_metrics(
+    metrics: list[dict[str, Any]],
+    reporting_period: str | None,
+    reporting_period_end_date: str | None,
+) -> list[dict[str, Any]]:
+    metrics_by_key = {item.get("metric_key"): item for item in metrics if isinstance(item, dict)}
+    period_label = reporting_period
+    period_end_date = reporting_period_end_date
+    is_ltm = _is_ltm_like_period(reporting_period)
+
+    def get_value(metric_key: str) -> float | None:
+        metric = metrics_by_key.get(metric_key)
+        if not isinstance(metric, dict) or not metric.get("found"):
+            return None
+        return _as_number(metric.get("value"))
+
+    def build_metric(
+        metric_key: str,
+        metric_name: str,
+        unit: str,
+        value: float | None,
+        notes: str | None = None,
+        found: bool | None = None,
+    ) -> dict[str, Any]:
+        is_found = found if found is not None else value is not None
+        normalized_value = round(value, 6) if value is not None else None
+        return {
+            "metric_key": metric_key,
+            "metric_name": metric_name,
+            "found": bool(is_found),
+            "value": normalized_value if is_found else None,
+            "unit": unit if is_found else None,
+            "scale_multiplier": 1.0 if is_found else None,
+            "period_label": period_label,
+            "period_end_date": period_end_date,
+            "selection_level": "calculated",
+            "statement": "Calculated from parsed metrics",
+            "page": None,
+            "evidence": None,
+            "confidence": 1.0 if is_found else None,
+            "notes": notes,
+        }
+
+    operating_profit = get_value(OPERATING_PROFIT_KEY)
+    depreciation = get_value(DEPRECIATION_KEY)
+    revenue = get_value(REVENUE_KEY)
+    interest_expense = get_value(INTEREST_EXPENSE_KEY)
+    long_term_debt = get_value(LONG_TERM_DEBT_KEY)
+    short_term_debt = get_value(SHORT_TERM_DEBT_KEY)
+    cash = get_value(CASH_KEY)
+
+    ebitda_value: float | None = None
+    total_debt_value: float | None = None
+    net_debt_value: float | None = None
+
+    calculated: list[dict[str, Any]] = []
+
+    if operating_profit is None or depreciation is None:
+        missing_parts = []
+        if operating_profit is None:
+            missing_parts.append("operating_profit")
+        if depreciation is None:
+            missing_parts.append("depreciation")
+        calculated.append(
+            build_metric(
+                metric_key=CALC_EBITDA_KEY,
+                metric_name="EBITDA",
+                unit=TARGET_RUB_BN_UNIT,
+                value=None,
+                found=False,
+                notes=f"Cannot calculate EBITDA: missing {', '.join(missing_parts)}.",
+            )
+        )
+    else:
+        ebitda_value = operating_profit + depreciation
+        calculated.append(
+            build_metric(
+                metric_key=CALC_EBITDA_KEY,
+                metric_name="EBITDA",
+                unit=TARGET_RUB_BN_UNIT,
+                value=ebitda_value,
+                notes="Calculated as operating_profit + depreciation.",
+            )
+        )
+
+    if ebitda_value is None or revenue is None:
+        missing_parts = []
+        if ebitda_value is None:
+            missing_parts.append("ebitda")
+        if revenue is None:
+            missing_parts.append("revenue")
+        calculated.append(
+            build_metric(
+                metric_key=CALC_EBITDA_MARGIN_KEY,
+                metric_name="Рентабельность EBITDA",
+                unit="%",
+                value=None,
+                found=False,
+                notes=f"Cannot calculate EBITDA margin: missing {', '.join(missing_parts)}.",
+            )
+        )
+    elif revenue == 0:
+        calculated.append(
+            build_metric(
+                metric_key=CALC_EBITDA_MARGIN_KEY,
+                metric_name="Рентабельность EBITDA",
+                unit="%",
+                value=None,
+                found=False,
+                notes="Cannot calculate EBITDA margin: revenue is zero.",
+            )
+        )
+    else:
+        calculated.append(
+            build_metric(
+                metric_key=CALC_EBITDA_MARGIN_KEY,
+                metric_name="Рентабельность EBITDA",
+                unit="%",
+                value=(ebitda_value / revenue) * 100.0,
+                notes="Calculated as EBITDA / revenue * 100.",
+            )
+        )
+
+    if long_term_debt is None or short_term_debt is None:
+        missing_parts = []
+        if short_term_debt is None:
+            missing_parts.append("short_term_debt_and_lease")
+        if long_term_debt is None:
+            missing_parts.append("long_term_debt_and_lease")
+        calculated.append(
+            build_metric(
+                metric_key=CALC_TOTAL_DEBT_KEY,
+                metric_name="Долг всего",
+                unit=TARGET_RUB_BN_UNIT,
+                value=None,
+                found=False,
+                notes=f"Cannot calculate total debt: missing {', '.join(missing_parts)}.",
+            )
+        )
+    else:
+        total_debt_value = short_term_debt + long_term_debt
+        calculated.append(
+            build_metric(
+                metric_key=CALC_TOTAL_DEBT_KEY,
+                metric_name="Долг всего",
+                unit=TARGET_RUB_BN_UNIT,
+                value=total_debt_value,
+                notes="Calculated as short_term_debt_and_lease + long_term_debt_and_lease.",
+            )
+        )
+
+    if total_debt_value is None or cash is None:
+        missing_parts = []
+        if total_debt_value is None:
+            missing_parts.append("total_debt")
+        if cash is None:
+            missing_parts.append("cash_and_cash_equivalents")
+        calculated.append(
+            build_metric(
+                metric_key=CALC_NET_DEBT_KEY,
+                metric_name="Чистый долг",
+                unit=TARGET_RUB_BN_UNIT,
+                value=None,
+                found=False,
+                notes=f"Cannot calculate net debt: missing {', '.join(missing_parts)}.",
+            )
+        )
+    else:
+        net_debt_value = total_debt_value - cash
+        calculated.append(
+            build_metric(
+                metric_key=CALC_NET_DEBT_KEY,
+                metric_name="Чистый долг",
+                unit=TARGET_RUB_BN_UNIT,
+                value=net_debt_value,
+                notes="Calculated as total_debt - cash_and_cash_equivalents.",
+            )
+        )
+
+    if ebitda_value is None or interest_expense is None:
+        missing_parts = []
+        if ebitda_value is None:
+            missing_parts.append("ebitda")
+        if interest_expense is None:
+            missing_parts.append("interest_expense_loans")
+        calculated.append(
+            build_metric(
+                metric_key=CALC_EBITDA_TO_INTEREST_KEY,
+                metric_name="EBITDA / % расходы",
+                unit="x",
+                value=None,
+                found=False,
+                notes=f"Cannot calculate EBITDA / interest expense: missing {', '.join(missing_parts)}.",
+            )
+        )
+    else:
+        denominator = abs(interest_expense)
+        if denominator == 0:
+            calculated.append(
+                build_metric(
+                    metric_key=CALC_EBITDA_TO_INTEREST_KEY,
+                    metric_name="EBITDA / % расходы",
+                    unit="x",
+                    value=None,
+                    found=False,
+                    notes="Cannot calculate EBITDA / interest expense: denominator is zero.",
+                )
+            )
+        else:
+            calculated.append(
+                build_metric(
+                    metric_key=CALC_EBITDA_TO_INTEREST_KEY,
+                    metric_name="EBITDA / % расходы",
+                    unit="x",
+                    value=ebitda_value / denominator,
+                    notes="Calculated as EBITDA / abs(interest_expense_loans).",
+                )
+            )
+
+    if net_debt_value is None or ebitda_value is None:
+        missing_parts = []
+        if net_debt_value is None:
+            missing_parts.append("net_debt")
+        if ebitda_value is None:
+            missing_parts.append("ebitda")
+        calculated.append(
+            build_metric(
+                metric_key=CALC_NET_DEBT_TO_EBITDA_LTM_KEY,
+                metric_name="Чистый долг / EBITDA LTM",
+                unit="x",
+                value=None,
+                found=False,
+                notes=f"Cannot calculate net debt / EBITDA LTM: missing {', '.join(missing_parts)}.",
+            )
+        )
+    elif ebitda_value <= 0:
+        calculated.append(
+            build_metric(
+                metric_key=CALC_NET_DEBT_TO_EBITDA_LTM_KEY,
+                metric_name="Чистый долг / EBITDA LTM",
+                unit="x",
+                value=None,
+                found=False,
+                notes="Cannot calculate net debt / EBITDA LTM: EBITDA is zero or negative.",
+            )
+        )
+    else:
+        notes = "Calculated as net_debt / EBITDA."
+        if not is_ltm:
+            notes = f"{notes} EBITDA is not explicitly LTM in reporting_period."
+        calculated.append(
+            build_metric(
+                metric_key=CALC_NET_DEBT_TO_EBITDA_LTM_KEY,
+                metric_name="Чистый долг / EBITDA LTM",
+                unit="x",
+                value=net_debt_value / ebitda_value,
+                notes=notes,
+            )
+        )
+
+    return calculated
+
+
+def _is_ltm_like_period(reporting_period: str | None) -> bool:
+    if not reporting_period:
+        return False
+    text = reporting_period.strip().lower()
+    if not text:
+        return False
+    if re.search(r"\b(ltm|12m|fy|full\s*year|annual)\b", text):
+        return True
+    if re.search(r"\b(1q|q1|q2|q3|h1|6m|9m)\b", text):
+        return False
+    if re.search(r"^\s*20\d{2}\s*$", text):
+        return True
+    return False
 
 
 def _is_rub_currency(currency: str | None) -> bool:

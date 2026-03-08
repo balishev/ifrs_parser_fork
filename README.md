@@ -10,6 +10,7 @@ This project extracts a defined set of IFRS financial metrics from a PDF report 
 - Metric set: default list in code, or custom list from JSON config.
 - All numeric output values are converted to `RUB bn` (billions of rubles).
 - Only latest reporting period is returned; prior/comparative period values are excluded.
+- Additional calculated metrics are added to output based on parsed values.
 
 Default metric set:
 
@@ -24,6 +25,15 @@ Default metric set:
 - Операционная прибыль (`operating_profit`)
 - Долгосрочные обязательства: кредиты + лизинг (`long_term_debt_and_lease`)
 - Краткосрочные обязательства: кредиты + лизинг (`short_term_debt_and_lease`)
+
+Calculated metrics in output:
+
+- EBITDA = `operating_profit + depreciation`
+- EBITDA margin, % = `EBITDA / revenue * 100`
+- Total debt = `short_term_debt_and_lease + long_term_debt_and_lease`
+- Net debt = `total_debt - cash_and_cash_equivalents`
+- EBITDA / % expenses = `EBITDA / abs(interest_expense_loans)`
+- Net debt / EBITDA LTM
 
 ## Requirements
 
@@ -83,6 +93,80 @@ Optional parameters:
 - `--api-key` (if not using env var)
 - `--credentials-json` (service account key path for Vertex mode)
 - `--project` and `--location` (Vertex settings)
+
+## HTTP API (async, with OpenAPI)
+
+Run API server:
+
+```bash
+ifrs-api
+```
+
+or:
+
+```bash
+uvicorn ifrs_parser.api:app --host 0.0.0.0 --port 8000
+```
+
+API docs (OpenAPI/Swagger):
+
+- `http://localhost:8000/docs`
+- `http://localhost:8000/openapi.json`
+
+Environment variables for auth/config:
+
+- `GOOGLE_API_KEY` or `GEMINI_API_KEY` for Gemini API key mode.
+- `IFRS_VERTEX_CREDENTIALS_JSON` + `IFRS_VERTEX_PROJECT` for Vertex mode.
+- `GOOGLE_CLOUD_LOCATION` (optional, default `us-central1`).
+- `IFRS_API_HOST` and `IFRS_API_PORT` for server bind settings.
+
+Request example:
+
+```bash
+curl -X POST "http://localhost:8000/parse" \
+  -F "file=@/path/to/ifrs_report.pdf" \
+  -F "period_hint=Q2 2025" \
+  -F "model=gemini-2.5-flash"
+```
+
+Response: same JSON structure as CLI output (`metrics`, `missing_metrics`, etc.).
+
+## Telegram Bot (async)
+
+Run bot:
+
+```bash
+export TELEGRAM_BOT_TOKEN="your_telegram_bot_token"
+ifrs-telegram-bot
+```
+
+or:
+
+```bash
+ifrs-telegram-bot --token "your_telegram_bot_token"
+```
+
+or via token file `tg_token`:
+
+```bash
+echo 'TOKEN = your_telegram_bot_token' > tg_token
+ifrs-telegram-bot
+```
+
+How it works:
+
+- Send IFRS PDF as a document to the bot.
+- Optional caption: `period_hint=Q2 2025`.
+- Bot parses PDF and sends back CSV with extracted metrics.
+- `/start` sends a welcome message with usage.
+- `/help` asks user to leave feedback (`Ошибка`, `Изменение`, `Вопрос`) in the next text message.
+- Feedback is forwarded to support chat (default id: `780684269`).
+
+Bot uses the same Google auth env vars as CLI/API:
+
+- `GOOGLE_API_KEY` or `GEMINI_API_KEY`, or
+- `IFRS_VERTEX_CREDENTIALS_JSON` + `IFRS_VERTEX_PROJECT`
+- Optional: `IFRS_FEEDBACK_CHAT_ID` to override default feedback chat id.
 
 ## Metrics config format
 

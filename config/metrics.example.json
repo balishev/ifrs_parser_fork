@@ -1,0 +1,42 @@
+[
+  {
+    "key": "revenue",
+    "name": "Выручка",
+    "description": "Revenue from IFRS statement of profit or loss."
+  },
+  {
+    "key": "interest_expense_loans",
+    "name": "Финансовые расходы (проценты по кредитам)",
+    "description": "Priority: bank loan interest expense; else total interest expense; else total finance costs."
+  },
+  {
+    "key": "depreciation",
+    "name": "Амортизация",
+    "description": "Depreciation and amortization expense."
+  },
+  {
+    "key": "cash_and_cash_equivalents",
+    "name": "Денежные средства и эквиваленты",
+    "description": "Cash and cash equivalents from statement of financial position."
+  },
+  {
+    "key": "property_plant_and_equipment",
+    "name": "Основные средства",
+    "description": "Property, plant and equipment (PPE)."
+  },
+  {
+    "key": "operating_profit",
+    "name": "Операционная прибыль",
+    "description": "Operating profit or operating income."
+  },
+  {
+    "key": "long_term_debt_and_lease",
+    "name": "Долгосрочные обязательства (кредиты+лизинг)",
+    "description": "Sum of non-current borrowings and non-current lease liabilities."
+  },
+  {
+    "key": "short_term_debt_and_lease",
+    "name": "Краткосрочные обязательства (кредиты+лизинг)",
+    "description": "Sum of current borrowings and current lease liabilities."
+  }
+]

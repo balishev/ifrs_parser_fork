@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ifrs-parser"
+version = "0.1.0"
+description = "IFRS PDF parser powered by Google AI API"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "google-genai>=1.30.0",
+  "google-auth>=2.0.0",
+  "openpyxl>=3.1.0",
+]
+
+[project.scripts]
+ifrs-parser = "ifrs_parser.cli:main"
+ifrs-compare-excel = "ifrs_parser.compare_excel:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

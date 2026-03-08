@@ -1,0 +1,643 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import time
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+from typing import Any, Sequence
+
+from .metrics import MetricDefinition
+
+DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_LOCATION = "us-central1"
+MAX_INLINE_PDF_BYTES = 19 * 1024 * 1024
+DEPRECIATION_KEY = "depreciation"
+PPE_KEY = "property_plant_and_equipment"
+TARGET_SCALE_BN = 1_000_000_000.0
+TARGET_RUB_BN_UNIT = "RUB bn"
+_ISO_DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+_DOT_DATE_RE = re.compile(r"\b(\d{1,2})[./](\d{1,2})[./](\d{4})\b")
+_TEXT_DATE_RE = re.compile(r"\b(\d{1,2})\s+([A-Za-zА-Яа-я]+)\s+(\d{4})\b")
+_QUARTER_RE = re.compile(r"\bQ([1-4])\s*(\d{4})\b", re.IGNORECASE)
+_YEAR_RE = re.compile(r"\b(20\d{2})\b")
+_MONTH_MAP = {
+    "january": 1,
+    "jan": 1,
+    "february": 2,
+    "feb": 2,
+    "march": 3,
+    "mar": 3,
+    "april": 4,
+    "apr": 4,
+    "may": 5,
+    "june": 6,
+    "jun": 6,
+    "july": 7,
+    "jul": 7,
+    "august": 8,
+    "aug": 8,
+    "september": 9,
+    "sep": 9,
+    "october": 10,
+    "oct": 10,
+    "november": 11,
+    "nov": 11,
+    "december": 12,
+    "dec": 12,
+    "января": 1,
+    "январь": 1,
+    "февраля": 2,
+    "февраль": 2,
+    "марта": 3,
+    "март": 3,
+    "апреля": 4,
+    "апрель": 4,
+    "мая": 5,
+    "май": 5,
+    "июня": 6,
+    "июнь": 6,
+    "июля": 7,
+    "июль": 7,
+    "августа": 8,
+    "август": 8,
+    "сентября": 9,
+    "сентябрь": 9,
+    "октября": 10,
+    "октябрь": 10,
+    "ноября": 11,
+    "ноябрь": 11,
+    "декабря": 12,
+    "декабрь": 12,
+}
+
+
+@dataclass(slots=True)
+class IFRSParserConfig:
+    model: str = DEFAULT_MODEL
+    location: str = DEFAULT_LOCATION
+    timeout_sec: int = 300
+    poll_interval_sec: float = 2.0
+    keep_uploaded_file: bool = False
+
+
+class GoogleIFRSPdfParser:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        credentials_json: str | Path | None = None,
+        project: str | None = None,
+        config: IFRSParserConfig | None = None,
+    ) -> None:
+        try:
+            from google import genai
+            from google.genai import types
+        except ImportError as exc:
+            raise RuntimeError(
+                "google-genai is not installed. Run: pip install google-genai"
+            ) from exc
+
+        self._config = config or IFRSParserConfig()
+        self._types = types
+
+        if credentials_json:
+            credentials_path = Path(credentials_json)
+            if not credentials_path.exists():
+                raise FileNotFoundError(f"Credentials JSON not found: {credentials_path}")
+            try:
+                from google.oauth2 import service_account
+            except ImportError as exc:
+                raise RuntimeError(
+                    "google-auth is not installed. Run: pip install google-auth"
+                ) from exc
+
+            credentials = service_account.Credentials.from_service_account_file(
+                str(credentials_path),
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            )
+            resolved_project = project or credentials.project_id
+            if not resolved_project:
+                raise ValueError(
+                    "Project ID is missing. Provide --project or include project_id in credentials JSON."
+                )
+            self._client = genai.Client(
+                vertexai=True,
+                project=resolved_project,
+                location=self._config.location,
+                credentials=credentials,
+            )
+            self._use_files_api = False
+            return
+
+        resolved_key = api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        if not resolved_key:
+            raise ValueError(
+                "Google API key is missing. Set GOOGLE_API_KEY (or GEMINI_API_KEY), "
+                "or pass credentials_json for Vertex AI."
+            )
+
+        self._client = genai.Client(api_key=resolved_key)
+        self._use_files_api = True
+
+    def extract_metrics(
+        self,
+        pdf_path: str | Path,
+        metrics: Sequence[MetricDefinition],
+        period_hint: str | None = None,
+    ) -> dict[str, Any]:
+        source_path = Path(pdf_path)
+        if not source_path.exists():
+            raise FileNotFoundError(f"PDF file not found: {source_path}")
+        if source_path.suffix.lower() != ".pdf":
+            raise ValueError(f"Expected a .pdf file, got: {source_path.name}")
+        if not metrics:
+            raise ValueError("Metrics list must not be empty.")
+
+        prompt = _build_prompt(metrics, period_hint)
+        if self._use_files_api:
+            uploaded_file = self._client.files.upload(
+                file=str(source_path),
+                config={"mime_type": "application/pdf"},
+            )
+            try:
+                ready_file = self._wait_for_file(uploaded_file)
+                response = self._generate_response(prompt=prompt, document=ready_file, metrics=metrics)
+            finally:
+                if not self._config.keep_uploaded_file:
+                    self._try_delete_uploaded_file(uploaded_file)
+        else:
+            document_part = self._build_inline_pdf_part(source_path)
+            response = self._generate_response(prompt=prompt, document=document_part, metrics=metrics)
+
+        raw_payload = _parse_json_payload(_extract_response_text(response))
+        return _normalize_result(
+            payload=raw_payload,
+            source_document=source_path.name,
+            model=self._config.model,
+            metrics=metrics,
+        )
+
+    def _generate_response(
+        self,
+        prompt: str,
+        document: Any,
+        metrics: Sequence[MetricDefinition],
+    ) -> Any:
+        return self._client.models.generate_content(
+            model=self._config.model,
+            contents=[prompt, document],
+            config={
+                "temperature": 0,
+                "response_mime_type": "application/json",
+                "response_json_schema": _build_response_schema([metric.key for metric in metrics]),
+            },
+        )
+
+    def _wait_for_file(self, file_ref: Any) -> Any:
+        file_name = getattr(file_ref, "name", None)
+        if not file_name:
+            return file_ref
+
+        deadline = time.monotonic() + self._config.timeout_sec
+        current = file_ref
+        while True:
+            state = _file_state_name(current)
+            if state in {"ACTIVE", "READY", "SUCCEEDED", "SUCCESS", "UNSPECIFIED"}:
+                return current
+            if state in {"FAILED", "ERROR"}:
+                raise RuntimeError(f"Uploaded file failed processing in Google API. State: {state}")
+            if time.monotonic() > deadline:
+                raise TimeoutError("Timed out while waiting for PDF processing in Google API.")
+            time.sleep(self._config.poll_interval_sec)
+            current = self._client.files.get(name=file_name)
+
+    def _try_delete_uploaded_file(self, file_ref: Any) -> None:
+        file_name = getattr(file_ref, "name", None)
+        if not file_name:
+            return
+        try:
+            self._client.files.delete(name=file_name)
+        except Exception:
+            return
+
+    def _build_inline_pdf_part(self, source_path: Path) -> Any:
+        pdf_bytes = source_path.read_bytes()
+        if len(pdf_bytes) > MAX_INLINE_PDF_BYTES:
+            raise ValueError(
+                f"PDF is too large for inline upload in Vertex mode: {len(pdf_bytes)} bytes. "
+                f"Limit is {MAX_INLINE_PDF_BYTES} bytes."
+            )
+        return self._types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
+
+
+def _build_prompt(metrics: Sequence[MetricDefinition], period_hint: str | None) -> str:
+    metric_lines = [
+        f"- {metric.key}: {metric.name}. {metric.description}"
+        for metric in metrics
+    ]
+    period_text = period_hint or "latest period presented in the report"
+    return "\n".join(
+        [
+            "You are an IFRS financial analyst.",
+            "Extract the target metrics from the attached IFRS report PDF.",
+            f"Focus period: {period_text}.",
+            "Rules:",
+            "1) Prefer consolidated IFRS statements when both consolidated and standalone data are present.",
+            "2) Determine latest reporting period end date in the document and return it as reporting_period_end_date (ISO YYYY-MM-DD).",
+            "3) Return exactly one item per requested metric_key and do not add extra keys.",
+            "4) Only return values for the latest period (matching reporting_period_end_date). Ignore prior/comparative period values.",
+            "5) Do not estimate values. For missing metrics set found=false and include a short note in notes.",
+            "6) Put numeric amount into value and indicate scaling in scale_multiplier:",
+            "   1 for units, 1000 for thousands, 1000000 for millions, 1000000000 for billions.",
+            "7) page must be the PDF page where the value is visible.",
+            "8) confidence must be between 0 and 1.",
+            "9) For debt+lease metrics, return the sum of loans/borrowings and lease liabilities for the same horizon.",
+            "   If lease liabilities are not separately disclosed for that horizon, use the corresponding 'other' liabilities for that horizon.",
+            "10) For each metric provide period_end_date in ISO YYYY-MM-DD.",
+            "11) For interest_expense_loans apply strict priority:",
+            "    a) 'Процентные расходы - кредиты банков' (or direct bank loan interest expense).",
+            "    b) If unavailable, use total 'Процентные расходы' (interest expense).",
+            "    c) If unavailable, use total 'Финансовые расходы' (finance costs).",
+            "    Set selection_level as one of: bank_loan_interest, interest_expense, finance_costs.",
+            "Requested metrics:",
+            *metric_lines,
+        ]
+    )
+
+
+def _build_response_schema(metric_keys: Sequence[str]) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "company_name": {"type": "string"},
+            "reporting_period": {"type": "string"},
+            "reporting_period_end_date": {"type": "string"},
+            "reporting_currency": {"type": "string"},
+            "notes": {"type": "string"},
+            "metrics": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "metric_key": {"type": "string", "enum": list(metric_keys)},
+                        "metric_name": {"type": "string"},
+                        "found": {"type": "boolean"},
+                        "value": {"type": "number"},
+                        "unit": {"type": "string"},
+                        "scale_multiplier": {"type": "number"},
+                        "period_label": {"type": "string"},
+                        "period_end_date": {"type": "string"},
+                        "selection_level": {"type": "string"},
+                        "statement": {"type": "string"},
+                        "page": {"type": "integer"},
+                        "evidence": {"type": "string"},
+                        "confidence": {"type": "number"},
+                        "notes": {"type": "string"},
+                    },
+                    "required": ["metric_key", "found"],
+                },
+            },
+        },
+        "required": ["metrics"],
+    }
+
+
+def _extract_response_text(response: Any) -> str:
+    text = getattr(response, "text", None)
+    if isinstance(text, str) and text.strip():
+        return text
+    raise RuntimeError("Google API returned empty response text.")
+
+
+def _parse_json_payload(raw_text: str) -> dict[str, Any]:
+    stripped = raw_text.strip()
+    if stripped.startswith("```"):
+        stripped = stripped.removeprefix("```json").removeprefix("```").strip()
+        if stripped.endswith("```"):
+            stripped = stripped[:-3].strip()
+
+    data = json.loads(stripped)
+    if not isinstance(data, dict):
+        raise ValueError("Expected JSON object from model response.")
+    return data
+
+
+def _normalize_result(
+    payload: dict[str, Any],
+    source_document: str,
+    model: str,
+    metrics: Sequence[MetricDefinition],
+) -> dict[str, Any]:
+    reporting_period = _as_string(payload.get("reporting_period"))
+    reporting_period_end_date = _extract_iso_date(payload.get("reporting_period_end_date")) or _extract_iso_date(
+        reporting_period
+    )
+    reporting_currency = _as_string(payload.get("reporting_currency"))
+    metric_map = {metric.key: metric for metric in metrics}
+    raw_metrics = payload.get("metrics")
+    if not isinstance(raw_metrics, list):
+        raw_metrics = []
+
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw_metrics:
+        if not isinstance(item, dict):
+            continue
+        key = _as_string(item.get("metric_key"))
+        if not key or key not in metric_map or key in seen:
+            continue
+        seen.add(key)
+        normalized.append(_normalize_metric(item, metric_map[key]))
+
+    for metric in metrics:
+        if metric.key not in seen:
+            normalized.append(
+                {
+                    "metric_key": metric.key,
+                    "metric_name": metric.name,
+                    "found": False,
+                    "value": None,
+                    "unit": None,
+                    "scale_multiplier": None,
+                    "period_label": None,
+                    "period_end_date": None,
+                    "selection_level": None,
+                    "statement": None,
+                    "page": None,
+                    "evidence": None,
+                    "confidence": None,
+                    "notes": "No value returned by model.",
+                }
+            )
+
+    _enforce_latest_period_only(normalized, reporting_period_end_date)
+    _apply_business_rules(normalized)
+    _convert_metrics_to_billion_rub(normalized, reporting_currency)
+    missing_metrics = [item["metric_key"] for item in normalized if not item["found"]]
+
+    return {
+        "source_document": source_document,
+        "model": model,
+        "company_name": _as_string(payload.get("company_name")),
+        "reporting_period": reporting_period,
+        "reporting_period_end_date": reporting_period_end_date,
+        "reporting_currency": reporting_currency,
+        "output_value_unit": TARGET_RUB_BN_UNIT,
+        "notes": _as_string(payload.get("notes")),
+        "metrics": normalized,
+        "missing_metrics": missing_metrics,
+    }
+
+
+def _normalize_metric(item: dict[str, Any], definition: MetricDefinition) -> dict[str, Any]:
+    found = bool(item.get("found"))
+    value = _as_number(item.get("value"))
+    scale_multiplier = _as_number(item.get("scale_multiplier"))
+    page = _as_int(item.get("page"))
+    confidence = _as_number(item.get("confidence"))
+    if confidence is not None:
+        confidence = max(0.0, min(1.0, confidence))
+
+    if not found:
+        value = None
+        scale_multiplier = None
+        page = None
+        confidence = None
+
+    return {
+        "metric_key": definition.key,
+        "metric_name": _as_string(item.get("metric_name")) or definition.name,
+        "found": found,
+        "value": value,
+        "unit": _as_string(item.get("unit")),
+        "scale_multiplier": scale_multiplier,
+        "period_label": _as_string(item.get("period_label")),
+        "period_end_date": _extract_iso_date(item.get("period_end_date")) or _extract_iso_date(item.get("period_label")),
+        "selection_level": _as_string(item.get("selection_level")),
+        "statement": _as_string(item.get("statement")),
+        "page": page,
+        "evidence": _as_string(item.get("evidence")),
+        "confidence": confidence,
+        "notes": _as_string(item.get("notes")),
+    }
+
+
+def _enforce_latest_period_only(
+    metrics: list[dict[str, Any]],
+    reporting_period_end_date: str | None,
+) -> None:
+    if not reporting_period_end_date:
+        return
+
+    for item in metrics:
+        if not item.get("found"):
+            continue
+        metric_period_end = _extract_iso_date(item.get("period_end_date")) or _extract_iso_date(
+            item.get("period_label")
+        )
+        if metric_period_end != reporting_period_end_date:
+            _mark_metric_not_found(
+                item,
+                f"Excluded because metric period ({metric_period_end or 'unknown'}) does not match "
+                f"latest period ({reporting_period_end_date}).",
+            )
+
+
+def _apply_business_rules(metrics: list[dict[str, Any]]) -> None:
+    metrics_by_key = {item["metric_key"]: item for item in metrics}
+
+    depreciation = metrics_by_key.get(DEPRECIATION_KEY)
+    ppe = metrics_by_key.get(PPE_KEY)
+    if not depreciation or not ppe:
+        return
+    if depreciation["found"]:
+        return
+    ppe_value = _as_number(ppe.get("value"))
+    if not ppe.get("found") or ppe_value is None:
+        return
+
+    estimated_value = round(ppe_value * 0.1, 6)
+    depreciation["found"] = True
+    depreciation["value"] = estimated_value
+    depreciation["unit"] = depreciation.get("unit") or ppe.get("unit")
+    depreciation["scale_multiplier"] = depreciation.get("scale_multiplier") or ppe.get("scale_multiplier")
+    depreciation["period_label"] = depreciation.get("period_label") or ppe.get("period_label")
+    depreciation["period_end_date"] = depreciation.get("period_end_date") or ppe.get("period_end_date")
+    depreciation["statement"] = depreciation.get("statement") or "Estimated from PPE"
+    depreciation["page"] = depreciation.get("page") or ppe.get("page")
+    depreciation["evidence"] = depreciation.get("evidence") or f"Estimated as 10% of {PPE_KEY}."
+    depreciation["confidence"] = 0.35
+    depreciation["notes"] = _append_note(
+        depreciation.get("notes"),
+        "Estimated as 10% of PPE because depreciation was not explicitly disclosed.",
+    )
+
+
+def _append_note(existing: Any, suffix: str) -> str:
+    base = _as_string(existing)
+    if not base:
+        return suffix
+    return f"{base} {suffix}"
+
+
+def _mark_metric_not_found(metric: dict[str, Any], reason: str) -> None:
+    metric["found"] = False
+    metric["value"] = None
+    metric["unit"] = None
+    metric["scale_multiplier"] = None
+    metric["selection_level"] = None
+    metric["page"] = None
+    metric["evidence"] = None
+    metric["confidence"] = None
+    metric["notes"] = _append_note(metric.get("notes"), reason)
+
+
+def _convert_metrics_to_billion_rub(
+    metrics: list[dict[str, Any]],
+    reporting_currency: str | None,
+) -> None:
+    is_rub = _is_rub_currency(reporting_currency)
+    for item in metrics:
+        if not item.get("found"):
+            continue
+        value = _as_number(item.get("value"))
+        if value is None:
+            continue
+        scale_multiplier = _as_number(item.get("scale_multiplier")) or 1.0
+        absolute_value = value * scale_multiplier
+        item["value"] = round(absolute_value / TARGET_SCALE_BN, 6)
+        item["scale_multiplier"] = 1.0
+        item["unit"] = TARGET_RUB_BN_UNIT
+        if not is_rub:
+            item["notes"] = _append_note(
+                item.get("notes"),
+                "Converted to RUB bn format, but reporting_currency is not RUB.",
+            )
+
+
+def _is_rub_currency(currency: str | None) -> bool:
+    if not currency:
+        return False
+    normalized = currency.strip().upper()
+    return normalized in {"RUB", "RUR", "РУБ", "РУБ.", "RUSSIAN RUBLE", "RUSSIAN ROUBLE"}
+
+
+def _extract_iso_date(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+
+    iso_match = _ISO_DATE_RE.search(text)
+    if iso_match:
+        parsed = _safe_iso_date(iso_match.group(1))
+        if parsed:
+            return parsed
+
+    dot_match = _DOT_DATE_RE.search(text)
+    if dot_match:
+        day, month, year = int(dot_match.group(1)), int(dot_match.group(2)), int(dot_match.group(3))
+        parsed = _safe_date(year, month, day)
+        if parsed:
+            return parsed
+
+    text_match = _TEXT_DATE_RE.search(text)
+    if text_match:
+        day = int(text_match.group(1))
+        month_name = text_match.group(2).lower()
+        year = int(text_match.group(3))
+        month = _MONTH_MAP.get(month_name)
+        if month is not None:
+            parsed = _safe_date(year, month, day)
+            if parsed:
+                return parsed
+
+    quarter_match = _QUARTER_RE.search(text)
+    if quarter_match:
+        quarter = int(quarter_match.group(1))
+        year = int(quarter_match.group(2))
+        if quarter == 1:
+            return f"{year:04d}-03-31"
+        if quarter == 2:
+            return f"{year:04d}-06-30"
+        if quarter == 3:
+            return f"{year:04d}-09-30"
+        if quarter == 4:
+            return f"{year:04d}-12-31"
+
+    years = [int(year_text) for year_text in _YEAR_RE.findall(text)]
+    if years:
+        year = max(years)
+        return f"{year:04d}-12-31"
+
+    return None
+
+
+def _safe_iso_date(value: str) -> str | None:
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed.isoformat()
+
+
+def _safe_date(year: int, month: int, day: int) -> str | None:
+    try:
+        parsed = date(year, month, day)
+    except ValueError:
+        return None
+    return parsed.isoformat()
+
+
+def _file_state_name(file_ref: Any) -> str:
+    state = getattr(file_ref, "state", None)
+    if state is None:
+        return "UNSPECIFIED"
+    if isinstance(state, str):
+        return state.upper()
+    state_name = getattr(state, "name", None)
+    if isinstance(state_name, str):
+        return state_name.upper()
+    return str(state).upper()
+
+
+def _as_string(value: Any) -> str | None:
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    return None
+
+
+def _as_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip().replace(" ", "").replace(",", ".")
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _as_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float) and value.is_integer():
+        converted = int(value)
+        return converted if converted > 0 else None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            converted = int(text)
+            return converted if converted > 0 else None
+    return None

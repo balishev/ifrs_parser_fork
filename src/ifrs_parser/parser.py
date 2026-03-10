@@ -313,6 +313,9 @@ def _build_prompt(metrics: Sequence[MetricDefinition], period_hint: str | None) 
             "    b) If unavailable, use total 'Процентные расходы' (interest expense).",
             "    c) If unavailable, use total 'Финансовые расходы' (finance costs).",
             "    Set selection_level as one of: bank_loan_interest, interest_expense, finance_costs.",
+            "12) Also identify ultimate beneficial owner surname (UBO) only if explicitly disclosed in report notes",
+            "    (examples: 'ultimate controlling party', 'конечный бенефициар').",
+            "    Return surname only in ubo_surname. If unknown, return empty string.",
             "Requested metrics:",
             *metric_lines,
         ]
@@ -347,6 +350,7 @@ def _build_response_schema(metric_keys: Sequence[str]) -> dict[str, Any]:
         "type": "object",
         "properties": {
             "company_name": {"type": "string"},
+            "ubo_surname": {"type": "string"},
             "reporting_period": {"type": "string"},
             "reporting_period_end_date": {"type": "string"},
             "reporting_currency": {"type": "string"},
@@ -432,6 +436,7 @@ def _normalize_result(
         "source_document": source_document,
         "model": model,
         "company_name": _as_string(payload.get("company_name")),
+        "ubo_surname": _as_string(payload.get("ubo_surname")),
         "reporting_period": reporting_period,
         "reporting_period_end_date": reporting_period_end_date,
         "reporting_currency": reporting_currency,

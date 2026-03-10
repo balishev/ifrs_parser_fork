@@ -27,6 +27,8 @@ Fill required fields:
 - `spreadsheet_id`: keep empty to auto-create sheet on first init.
 - `worksheet_name`: target tab name.
 - `share_with`: emails that should get access to newly created sheet.
+- `ubo_by_company` (optional): mapping `company_name -> фамилия UBO` for reliable заполнение столбца `UBO`.
+- `ubo_unknown_value` (optional): fallback text if UBO is not found.
 
 ## 4) Initialize target sheet
 
@@ -48,7 +50,7 @@ Any parser flow can append rows to Google Sheets:
 
 Rows are written in the one-pager-like column format:
 
-- `Отрасль`, `Компания`, `Type`, `Показатель`, `Сегмент`, `Сегмент`, `Источник`, `Ед.изм.`, `LTM`, `2025`, `2024`, `2023`, `2022`
+- `Отрасль`, `UBO`, `Компания`, `Type`, `Показатель`, `Сегмент`, `Сегмент`, `Источник`, `Ед.изм.`, `LTM`, `2025`, `2024`, `2023`, `2022`
 
 Values are placed in:
 
@@ -62,3 +64,7 @@ If parser returns both latest and comparative values, both are written into the 
 
 - latest value goes to its own year/H/Q slot;
 - comparative value goes to its own earlier slot (for balance metrics it can be prior year-end).
+
+Column `UBO` is filled for every exported row of the company:
+
+- source priority: parser field `ubo_surname` -> config mapping `ubo_by_company` -> `ubo_unknown_value`.

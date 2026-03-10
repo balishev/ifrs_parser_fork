@@ -99,7 +99,7 @@ Optional parameters:
 
 After parsing, result can be appended to Google Sheets in one-pager-like column format:
 
-- `Отрасль`, `Компания`, `Type`, `Показатель`, `Сегмент`, `Сегмент`, `Источник`, `Ед.изм.`, `LTM`, `2025`, `2024`, `2023`, `2022`
+- `Отрасль`, `UBO`, `Компания`, `Type`, `Показатель`, `Сегмент`, `Сегмент`, `Источник`, `Ед.изм.`, `LTM`, `2025`, `2024`, `2023`, `2022`
 - Period split inside year is supported:
   - `3M` -> quarter columns (`1Q/2Q/3Q/4Q`)
   - `6M` -> half-year columns (`1H/2H`)
@@ -230,6 +230,7 @@ Output is a JSON object like:
   "source_document": "report.pdf",
   "model": "gemini-2.5-flash",
   "company_name": "Example PLC",
+  "ubo_surname": "Иванов",
   "reporting_period": "FY2025",
   "reporting_period_end_date": "2025-12-31",
   "reporting_currency": "RUB",
@@ -276,6 +277,8 @@ Output is a JSON object like:
 ```
 
 `missing_metrics` contains metric keys that were not found.
+
+`ubo_surname` is extracted when UBO/ultimate controlling party is explicitly disclosed in report text.
 
 Business rule:
 

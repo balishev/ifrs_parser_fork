@@ -11,5 +11,9 @@
   "source_label": "МСФО",
   "type_label": "Source",
   "default_industry": "",
-  "include_not_found_metrics": false
+  "include_not_found_metrics": false,
+  "ubo_unknown_value": "Не определен",
+  "ubo_by_company": {
+    "ПАО «СИБУР Холдинг»": "Михельсон"
+  }
 }

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -10,8 +12,8 @@ from typing import Any
 
 DEFAULT_CONFIG_PATH = Path("config/sheets_export.json")
 DEFAULT_HEADERS = [
-    "",
     "Отрасль",
+    "UBO",
     "Компания",
     "Type",
     "Показатель",
@@ -127,6 +129,8 @@ class SheetsExportConfig:
     type_label: str = "Source"
     default_industry: str = ""
     include_not_found_metrics: bool = False
+    ubo_by_company: dict[str, str] = field(default_factory=dict)
+    ubo_unknown_value: str = "Не определен"
 
 
 def append_result_to_google_sheets(
@@ -213,6 +217,7 @@ class GoogleSheetsExporter:
         self._ltm_col = DEFAULT_LTM_COL
         self._half_cols = dict(DEFAULT_HALF_COLS)
         self._quarter_cols = dict(DEFAULT_QUARTER_COLS)
+        self._max_write_retries = 6
 
     def ensure_ready(self) -> dict[str, Any]:
         self._ensure_spreadsheet()
@@ -239,9 +244,27 @@ class GoogleSheetsExporter:
         if not rows:
             return {**info, "status": "no_rows", "appended_rows": 0}
 
+        company_name = _as_non_empty_str(result.get("company_name"))
+        self._remove_legacy_ubo_metric_rows(company_name)
         self._merge_duplicate_rows()
         self._upsert_rows(rows)
         return {**info, "status": "ok", "appended_rows": len(rows)}
+
+    def _remove_legacy_ubo_metric_rows(self, company_name: str | None) -> None:
+        if not company_name:
+            return
+        all_rows = self._worksheet.get_all_values()
+        if len(all_rows) <= 1:
+            return
+        target_company = _normalize_lookup_text(company_name)
+        to_delete: list[int] = []
+        for row_idx, row in enumerate(all_rows[1:], start=2):
+            row_company = _normalize_lookup_text(_row_value(row, 3))
+            metric_name = _normalize_lookup_text(_row_value(row, 5))
+            if row_company == target_company and metric_name == "ubo":
+                to_delete.append(row_idx)
+        for row_idx in sorted(to_delete, reverse=True):
+            self._call_with_write_retry(self._worksheet.delete_rows, row_idx)
 
     def _upsert_rows(self, rows: list[list[Any]]) -> None:
         existing_rows = self._worksheet.get_all_values()
@@ -251,6 +274,11 @@ class GoogleSheetsExporter:
             if key and key not in key_to_row_index:
                 key_to_row_index[key] = idx
 
+        existing_row_map: dict[int, list[Any]] = {
+            idx: list(row)
+            for idx, row in enumerate(existing_rows[1:], start=2)
+        }
+
         time_cols = sorted(
             {
                 self._ltm_col,
@@ -259,6 +287,12 @@ class GoogleSheetsExporter:
                 *self._quarter_cols.values(),
             }
         )
+        update_cols = [*range(1, 10), *time_cols]
+        max_col = max(update_cols) if update_cols else 10
+
+        new_rows: list[list[Any]] = []
+        pending_updates: dict[int, list[Any]] = {}
+        next_append_row = self._next_append_row()
 
         for row in rows:
             key = _sheet_row_key(row)
@@ -267,21 +301,49 @@ class GoogleSheetsExporter:
 
             target_row_idx = key_to_row_index.get(key)
             if target_row_idx is None:
-                self._append_new_rows([row])
-                target_row_idx = self._next_append_row() - 1
+                new_rows.append(row)
+                target_row_idx = next_append_row + len(new_rows) - 1
                 key_to_row_index[key] = target_row_idx
+                continue
 
-            for col_idx in range(2, 10):
+            base_row = pending_updates.get(target_row_idx)
+            if base_row is None:
+                base_row = list(existing_row_map.get(target_row_idx, []))
+                pending_updates[target_row_idx] = base_row
+
+            changed = False
+            for col_idx in update_cols:
                 new_value = _row_value(row, col_idx)
                 if _is_blank(new_value):
                     continue
-                self._worksheet.update_cell(target_row_idx, col_idx, new_value)
-
-            for col_idx in time_cols:
-                new_value = _row_value(row, col_idx)
-                if _is_blank(new_value):
+                current_value = _row_value(base_row, col_idx)
+                if _cell_values_equal(current_value, new_value):
                     continue
-                self._worksheet.update_cell(target_row_idx, col_idx, new_value)
+                _set_cell(base_row, col_idx, new_value)
+                changed = True
+
+            if not changed:
+                pending_updates.pop(target_row_idx, None)
+
+        if new_rows:
+            self._append_new_rows(new_rows)
+
+        if not pending_updates:
+            return
+
+        requests: list[dict[str, Any]] = []
+        for row_idx in sorted(pending_updates):
+            row_payload = pending_updates[row_idx]
+            if len(row_payload) < max_col:
+                row_payload.extend([""] * (max_col - len(row_payload)))
+            requests.append(
+                {
+                    "range": f"A{row_idx}:{_column_letter(max_col)}{row_idx}",
+                    "values": [row_payload[0:max_col]],
+                }
+            )
+
+        self._write_batch_update(requests)
 
     def _append_new_rows(self, rows: list[list[Any]]) -> None:
         if not rows:
@@ -292,7 +354,7 @@ class GoogleSheetsExporter:
         end_row = start_row + len(padded_rows) - 1
         end_col = _column_letter(max_width)
         target_range = f"A{start_row}:{end_col}{end_row}"
-        self._worksheet.update(target_range, padded_rows, value_input_option="USER_ENTERED")
+        self._write_update(target_range, padded_rows)
 
     def _merge_duplicate_rows(self) -> None:
         all_rows = self._worksheet.get_all_values()
@@ -310,6 +372,8 @@ class GoogleSheetsExporter:
 
         primary_for_key: dict[tuple[str, ...], int] = {}
         duplicate_indices: list[int] = []
+        primary_updates: dict[int, list[Any]] = {}
+        changed_primary: set[int] = set()
         for row_idx, row in enumerate(all_rows[1:], start=2):
             key = _sheet_row_key(row)
             if not key:
@@ -319,26 +383,44 @@ class GoogleSheetsExporter:
                 primary_for_key[key] = row_idx
                 continue
 
-            primary_row = all_rows[primary_idx - 1]
+            primary_row = primary_updates.get(primary_idx)
+            if primary_row is None:
+                primary_row = list(all_rows[primary_idx - 1])
+                primary_updates[primary_idx] = primary_row
             duplicate_row = row
 
-            for col_idx in range(2, 10):
+            for col_idx in range(1, 10):
                 if _is_blank(_row_value(primary_row, col_idx)) and not _is_blank(_row_value(duplicate_row, col_idx)):
-                    self._worksheet.update_cell(primary_idx, col_idx, _row_value(duplicate_row, col_idx))
+                    _set_cell(primary_row, col_idx, _row_value(duplicate_row, col_idx))
+                    changed_primary.add(primary_idx)
 
             for col_idx in time_cols:
                 primary_value = _row_value(primary_row, col_idx)
                 duplicate_value = _row_value(duplicate_row, col_idx)
                 if _is_blank(primary_value) and not _is_blank(duplicate_value):
-                    self._worksheet.update_cell(primary_idx, col_idx, duplicate_value)
-                    if len(primary_row) < col_idx:
-                        primary_row.extend([""] * (col_idx - len(primary_row)))
-                    primary_row[col_idx - 1] = duplicate_value
+                    _set_cell(primary_row, col_idx, duplicate_value)
+                    changed_primary.add(primary_idx)
 
             duplicate_indices.append(row_idx)
 
+        max_col = max([9, *time_cols])
+        requests: list[dict[str, Any]] = []
+        for primary_idx, primary_row in sorted(primary_updates.items()):
+            if primary_idx not in changed_primary:
+                continue
+            if len(primary_row) < max_col:
+                primary_row.extend([""] * (max_col - len(primary_row)))
+            requests.append(
+                {
+                    "range": f"A{primary_idx}:{_column_letter(max_col)}{primary_idx}",
+                    "values": [primary_row[0:max_col]],
+                }
+            )
+        if requests:
+            self._write_batch_update(requests)
+
         for row_idx in sorted(duplicate_indices, reverse=True):
-            self._worksheet.delete_rows(row_idx)
+            self._call_with_write_retry(self._worksheet.delete_rows, row_idx)
 
     def _next_append_row(self) -> int:
         all_rows = self._worksheet.get_all_values()
@@ -435,7 +517,7 @@ class GoogleSheetsExporter:
         if _row_matches_template_header(first_row, DEFAULT_HEADERS):
             return
         end_col = _column_letter(len(DEFAULT_HEADERS))
-        self._worksheet.update(f"A1:{end_col}1", [DEFAULT_HEADERS], value_input_option="USER_ENTERED")
+        self._write_update(f"A1:{end_col}1", [DEFAULT_HEADERS])
 
     def _detect_columns(self) -> None:
         if self._worksheet is None:
@@ -476,6 +558,36 @@ class GoogleSheetsExporter:
         self._half_cols = half_cols or dict(DEFAULT_HALF_COLS)
         self._quarter_cols = quarter_cols or dict(DEFAULT_QUARTER_COLS)
 
+    def _write_update(self, target_range: str, values: list[list[Any]]) -> None:
+        self._call_with_write_retry(
+            self._worksheet.update,
+            values,
+            target_range,
+            value_input_option="USER_ENTERED",
+        )
+
+    def _write_batch_update(self, requests: list[dict[str, Any]]) -> None:
+        if not requests:
+            return
+        self._call_with_write_retry(
+            self._worksheet.batch_update,
+            requests,
+            value_input_option="USER_ENTERED",
+        )
+
+    def _call_with_write_retry(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        attempt = 0
+        while True:
+            try:
+                return fn(*args, **kwargs)
+            except Exception as exc:
+                if not _is_retryable_sheets_write_error(exc):
+                    raise
+                if attempt >= self._max_write_retries:
+                    raise
+                time.sleep(_sheets_retry_delay_seconds(attempt))
+                attempt += 1
+
 
 def build_rows_for_sheet(
     result: dict[str, Any],
@@ -488,6 +600,7 @@ def build_rows_for_sheet(
     metric_candidates_by_key = _collect_metric_candidates(result)
 
     company_name = _as_non_empty_str(result.get("company_name")) or "Не указано"
+    ubo_surname = _resolve_ubo_surname(result=result, config=config, company_name=company_name)
     reporting_period = _as_non_empty_str(result.get("reporting_period"))
     reporting_period_end_date = _as_non_empty_str(result.get("reporting_period_end_date"))
     fallback_year = _extract_year(reporting_period_end_date or "") or _extract_year(reporting_period or "")
@@ -509,7 +622,8 @@ def build_rows_for_sheet(
             continue
 
         row = [""] * max_col
-        _set_cell(row, 2, config.default_industry)
+        _set_cell(row, 1, config.default_industry)
+        _set_cell(row, 2, ubo_surname)
         _set_cell(row, 3, company_name)
         _set_cell(row, 4, config.type_label)
         _set_cell(row, 5, spec.label)
@@ -612,6 +726,8 @@ def load_sheets_export_config(
         type_label=_as_non_empty_str(raw_payload.get("type_label")) or "Source",
         default_industry=_as_non_empty_str(raw_payload.get("default_industry")) or "",
         include_not_found_metrics=_to_bool(raw_payload.get("include_not_found_metrics"), default=False),
+        ubo_by_company=_to_str_map(raw_payload.get("ubo_by_company")),
+        ubo_unknown_value=_as_non_empty_str(raw_payload.get("ubo_unknown_value")) or "Не определен",
     )
     return config, resolved_path, raw_payload
 
@@ -726,12 +842,43 @@ def _to_str_list(value: Any) -> list[str]:
     return []
 
 
+def _to_str_map(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, str] = {}
+    for key, raw_val in value.items():
+        key_text = _as_non_empty_str(key)
+        val_text = _as_non_empty_str(raw_val)
+        if key_text and val_text:
+            result[key_text] = val_text
+    return result
+
+
 def _normalize_lookup_text(value: Any) -> str:
     if value is None:
         return ""
     text = str(value).strip().lower().replace("ё", "е")
     text = re.sub(r"[^a-zа-я0-9]+", "", text)
     return text
+
+
+def _resolve_ubo_surname(
+    result: dict[str, Any],
+    config: SheetsExportConfig,
+    company_name: str,
+) -> str | None:
+    from_result = _as_non_empty_str(result.get("ubo_surname"))
+    if from_result:
+        return from_result
+
+    normalized_company = _normalize_lookup_text(company_name)
+    for raw_company, raw_ubo in config.ubo_by_company.items():
+        if _normalize_lookup_text(raw_company) == normalized_company:
+            resolved = _as_non_empty_str(raw_ubo)
+            if resolved:
+                return resolved
+
+    return _as_non_empty_str(config.ubo_unknown_value)
 
 
 def _sheet_row_key(row: list[Any]) -> tuple[str, ...] | None:
@@ -767,12 +914,46 @@ def _is_blank(value: Any) -> bool:
     return False
 
 
+def _cell_values_equal(left: Any, right: Any) -> bool:
+    if _is_blank(left) and _is_blank(right):
+        return True
+    left_num = _to_float(left)
+    right_num = _to_float(right)
+    if left_num is not None and right_num is not None:
+        return abs(left_num - right_num) < 1e-9
+    return str(left).strip() == str(right).strip()
+
+
+def _is_retryable_sheets_write_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    retryable_markers = [
+        "429",
+        "quota exceeded",
+        "rate limit",
+        "too many requests",
+        "resource exhausted",
+        "internal error",
+        "backend error",
+        "timed out",
+    ]
+    return any(marker in text for marker in retryable_markers)
+
+
+def _sheets_retry_delay_seconds(attempt: int) -> float:
+    base = 1.0
+    max_delay = 45.0
+    exp_delay = min(max_delay, base * (2**attempt))
+    jitter = random.uniform(0.0, min(1.0, exp_delay * 0.25))
+    return exp_delay + jitter
+
+
 def _row_matches_template_header(current_row: list[Any], template_row: list[str]) -> bool:
     if not current_row:
         return False
     # Check key non-empty anchors only; allow extra trailing columns.
     anchors = {
-        2: "Отрасль",
+        1: "Отрасль",
+        2: "UBO",
         3: "Компания",
         4: "Type",
         5: "Показатель",

@@ -1,5 +1,7 @@
 # IFRS PDF Parser (Google AI API)
 
+This fork is focused on extracting bank debt / loans notes from IFRS PDF reports and exporting results to a dedicated Google Sheets tab.
+
 This project extracts a defined set of IFRS financial metrics from a PDF report using Google Gemini API.
 
 ## What it does
@@ -11,6 +13,12 @@ This project extracts a defined set of IFRS financial metrics from a PDF report 
 - All numeric output values are converted to `RUB bn` (billions of rubles).
 - Latest period is returned in `metrics`, and previous comparable values are returned in `comparative_metrics`.
 - Additional calculated metrics are added to output based on parsed values.
+
+Also supported:
+
+- `bank-debt-notes` mode for extracting rows from IFRS notes/applications related to loans and borrowings.
+- In `bank-debt-notes` mode, reporting period is auto-detected from the report (quarter/half-year/9M/year). `--rep-year` is optional override.
+- Export of bank-debt rows to a separate Google Sheets worksheet (`bank_debt_worksheet_name`).
 
 Default metric set:
 
@@ -87,6 +95,7 @@ ifrs-parser \
 Optional parameters:
 
 - `--mode` (`metrics` or `bank-debt-notes`)
+- `--rep-year` (optional year override for `bank-debt-notes`, e.g. `2024`)
 - `--model` (default: `gemini-2.5-flash`)
 - `--period-hint` (example: `FY2025`)
 - `--timeout-sec` (default: `300`)
@@ -96,7 +105,7 @@ Optional parameters:
 - `--project` and `--location` (Vertex settings)
 - `--sheets-config` (path to Google Sheets export config)
 
-### Bank Debt Notes Mode (`PDF` or `images_text` + `rep_year`)
+### Bank Debt Notes Mode (`PDF` or `images_text`)
 
 For prompt logic focused on credit/loan notes from IFRS notes:
 
@@ -108,7 +117,7 @@ ifrs-parser \
   --pdf /path/to/ifrs_report.pdf \
   --credentials-json ./ifrs-parser-489510-ed0c01e3a0ca.json \
   --project ifrs-parser-489510 \
-  --out output/bank_debt_notes_2024.json
+  --out output/bank_debt_notes.json
 ```
 
 OCR text fallback:
@@ -117,6 +126,18 @@ OCR text fallback:
 ifrs-parser \
   --mode bank-debt-notes \
   --images-text-file /path/to/images_text.txt \
+  --credentials-json ./ifrs-parser-489510-ed0c01e3a0ca.json \
+  --project ifrs-parser-489510 \
+  --out output/bank_debt_notes.json
+```
+
+Optional explicit year filter:
+
+```bash
+ifrs-parser \
+  --mode bank-debt-notes \
+  --pdf /path/to/ifrs_report.pdf \
+  --rep-year 2024 \
   --credentials-json ./ifrs-parser-489510-ed0c01e3a0ca.json \
   --project ifrs-parser-489510 \
   --out output/bank_debt_notes_2024.json
@@ -221,7 +242,9 @@ ifrs-telegram-bot
 How it works:
 
 - Send IFRS PDF as a document to the bot.
+- Default parser mode is `bank-debt-notes` (can be overridden with caption `mode=metrics`).
 - Optional caption: `period_hint=Q2 2025`.
+- Optional caption year override: `rep_year=2024`.
 - Bot parses PDF and sends back CSV with extracted metrics.
 - If the same PDF was already processed before, bot skips parsing and sends company rows from Google Sheets.
 - `/start` sends a welcome message with usage.
@@ -235,6 +258,12 @@ Bot uses the same Google auth env vars as CLI/API:
 - Optional: `IFRS_FEEDBACK_CHAT_ID` to override default feedback chat id.
 - Optional: `IFRS_SHEETS_CONFIG_PATH` to auto-append parse result to Google Sheets.
 - Optional: `IFRS_TG_DOC_REGISTRY_PATH` to override local processed-doc registry path.
+
+## Troubleshooting
+
+- `429 RESOURCE_EXHAUSTED` from Vertex/Gemini: parser retries automatically with backoff.
+- Temporary network/API transport failures (`Server disconnected without sending a response`, timeouts, 5xx): parser retries automatically.
+- If retries still fail, resend the PDF after 10-30 seconds.
 
 ## Metrics config format
 

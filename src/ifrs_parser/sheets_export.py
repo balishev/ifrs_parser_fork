@@ -11,6 +11,15 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_CONFIG_PATH = Path("config/sheets_export.json")
+BANK_DEBT_HEADERS = [
+    "Название компании",
+    "Номер и название раздела (Примечания, Приложения)",
+    "Показатель",
+    "Приоритет",
+    "Период",
+    "Сумма",
+    "Единица измерения",
+]
 DEFAULT_HEADERS = [
     "Отрасль",
     "UBO",
@@ -123,6 +132,7 @@ class SheetsExportConfig:
     spreadsheet_id: str | None = None
     spreadsheet_title: str = "IFRS Parser Export"
     worksheet_name: str = "Импорт"
+    bank_debt_worksheet_name: str = "Банк_долг_анализ"
     create_spreadsheet_if_missing: bool = True
     share_with: list[str] = field(default_factory=list)
     source_label: str = "МСФО"
@@ -146,6 +156,29 @@ def append_result_to_google_sheets(
         return {"status": "disabled", "appended_rows": 0}
 
     exporter = GoogleSheetsExporter(config)
+    summary = exporter.append_result(result)
+    if resolved_path is not None:
+        _persist_spreadsheet_id_if_needed(
+            config_path=resolved_path,
+            raw_payload=raw_payload,
+            spreadsheet_id=summary.get("spreadsheet_id"),
+        )
+    return summary
+
+
+def append_bank_debt_result_to_google_sheets(
+    result: dict[str, Any],
+    config_path: str | Path | None = None,
+) -> dict[str, Any] | None:
+    loaded = load_sheets_export_config(config_path)
+    if loaded is None:
+        return None
+
+    config, resolved_path, raw_payload = loaded
+    if not config.enabled:
+        return {"status": "disabled", "written_rows": 0}
+
+    exporter = BankDebtSheetsExporter(config)
     summary = exporter.append_result(result)
     if resolved_path is not None:
         _persist_spreadsheet_id_if_needed(
@@ -589,6 +622,171 @@ class GoogleSheetsExporter:
                 attempt += 1
 
 
+class BankDebtSheetsExporter:
+    def __init__(self, config: SheetsExportConfig) -> None:
+        try:
+            import gspread
+        except ImportError as exc:
+            raise RuntimeError("gspread is not installed. Run: pip install gspread") from exc
+
+        credentials_json = _as_non_empty_str(config.credentials_json)
+        if not credentials_json:
+            raise ValueError("credentials_json is required in sheets export config.")
+
+        credentials_path = Path(credentials_json)
+        if not credentials_path.exists():
+            raise FileNotFoundError(f"Credentials JSON not found: {credentials_path}")
+        credentials_payload = json.loads(credentials_path.read_text(encoding="utf-8"))
+        self._service_account_email = _as_non_empty_str(credentials_payload.get("client_email"))
+
+        self._gspread = gspread
+        self._config = config
+        self._client = gspread.service_account(filename=str(credentials_path))
+        self._spreadsheet: Any | None = None
+        self._worksheet: Any | None = None
+        self._max_write_retries = 6
+
+    def ensure_ready(self) -> dict[str, Any]:
+        self._ensure_spreadsheet()
+        self._ensure_worksheet()
+        self._ensure_headers()
+        return {
+            "status": "ready",
+            "spreadsheet_id": self._spreadsheet.id,
+            "spreadsheet_url": self._spreadsheet.url,
+            "worksheet_name": self._worksheet.title,
+        }
+
+    def append_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        info = self.ensure_ready()
+        rows = _build_rows_for_bank_debt_sheet(result)
+        if not rows:
+            return {**info, "status": "no_rows", "written_rows": 0, "inserted_rows": 0, "updated_rows": 0}
+
+        existing_rows = self._worksheet.get_all_values()
+        key_to_row_idx: dict[tuple[str, ...], int] = {}
+        existing_by_idx: dict[int, list[str]] = {}
+        for idx, row in enumerate(existing_rows[1:], start=2):
+            existing_by_idx[idx] = row
+            key = _bank_debt_row_key(row)
+            if key and key not in key_to_row_idx:
+                key_to_row_idx[key] = idx
+
+        updates: list[dict[str, Any]] = []
+        inserts: list[list[Any]] = []
+        for row in rows:
+            key = _bank_debt_row_key(row)
+            if key is None:
+                continue
+            existing_idx = key_to_row_idx.get(key)
+            if existing_idx is None:
+                inserts.append(row)
+                continue
+            existing_row = existing_by_idx.get(existing_idx, [])
+            if _bank_debt_rows_equal(existing_row, row):
+                continue
+            updates.append(
+                {
+                    "range": f"A{existing_idx}:G{existing_idx}",
+                    "values": [row[:7]],
+                }
+            )
+
+        if updates:
+            self._call_with_write_retry(
+                self._worksheet.batch_update,
+                updates,
+                value_input_option="USER_ENTERED",
+            )
+        if inserts:
+            self._call_with_write_retry(
+                self._worksheet.append_rows,
+                [row[:7] for row in inserts],
+                value_input_option="USER_ENTERED",
+            )
+
+        return {
+            **info,
+            "status": "ok",
+            "written_rows": len(updates) + len(inserts),
+            "inserted_rows": len(inserts),
+            "updated_rows": len(updates),
+        }
+
+    def _ensure_spreadsheet(self) -> None:
+        if self._spreadsheet is not None:
+            return
+
+        spreadsheet_id = _as_non_empty_str(self._config.spreadsheet_id)
+        if spreadsheet_id:
+            self._spreadsheet = self._client.open_by_key(spreadsheet_id)
+            return
+
+        if not self._config.create_spreadsheet_if_missing:
+            raise ValueError("spreadsheet_id is missing and create_spreadsheet_if_missing=false.")
+
+        title = _as_non_empty_str(self._config.spreadsheet_title) or "IFRS Parser Export"
+        try:
+            self._spreadsheet = self._client.create(title)
+        except Exception as exc:
+            error_text = str(exc).lower()
+            if "quota" in error_text and "drive" in error_text:
+                email_hint = self._service_account_email or "<service-account-email>"
+                raise RuntimeError(
+                    "Service account cannot create new Google Sheet due Drive quota. "
+                    "Create the spreadsheet manually in your Google account, share it with "
+                    f"{email_hint}, then set spreadsheet_id in config/sheets_export.json."
+                ) from exc
+            raise
+        self._config.spreadsheet_id = self._spreadsheet.id
+        for email in self._config.share_with:
+            clean_email = email.strip()
+            if not clean_email:
+                continue
+            self._spreadsheet.share(clean_email, perm_type="user", role="writer", notify=False)
+
+    def _ensure_worksheet(self) -> None:
+        if self._worksheet is not None:
+            return
+        if self._spreadsheet is None:
+            self._ensure_spreadsheet()
+        assert self._spreadsheet is not None
+
+        title = _as_non_empty_str(self._config.bank_debt_worksheet_name) or "Банк_долг_анализ"
+        try:
+            self._worksheet = self._spreadsheet.worksheet(title)
+        except self._gspread.exceptions.WorksheetNotFound:
+            self._worksheet = self._spreadsheet.add_worksheet(title=title, rows=2000, cols=12)
+
+    def _ensure_headers(self) -> None:
+        if self._worksheet is None:
+            self._ensure_worksheet()
+        assert self._worksheet is not None
+
+        first_row = self._worksheet.row_values(1)
+        if _bank_debt_header_matches(first_row):
+            return
+        self._call_with_write_retry(
+            self._worksheet.update,
+            [BANK_DEBT_HEADERS],
+            "A1:G1",
+            value_input_option="USER_ENTERED",
+        )
+
+    def _call_with_write_retry(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        attempt = 0
+        while True:
+            try:
+                return fn(*args, **kwargs)
+            except Exception as exc:
+                if not _is_retryable_sheets_write_error(exc):
+                    raise
+                if attempt >= self._max_write_retries:
+                    raise
+                time.sleep(_sheets_retry_delay_seconds(attempt))
+                attempt += 1
+
+
 def build_rows_for_sheet(
     result: dict[str, Any],
     config: SheetsExportConfig,
@@ -675,6 +873,40 @@ def build_rows_for_sheet(
     return rows
 
 
+def _build_rows_for_bank_debt_sheet(result: dict[str, Any]) -> list[list[Any]]:
+    raw_rows = result.get("rows")
+    if not isinstance(raw_rows, list):
+        return []
+
+    rows: list[list[Any]] = []
+    for item in raw_rows:
+        if not isinstance(item, dict):
+            continue
+        company_name = _as_non_empty_str(item.get("company_name"))
+        section_name = _as_non_empty_str(item.get("section_name"))
+        indicator = _as_non_empty_str(item.get("indicator"))
+        priority = _to_int(item.get("priority"))
+        period = _as_non_empty_str(item.get("period"))
+        amount = _to_float(item.get("amount"))
+        unit = _as_non_empty_str(item.get("unit"))
+        if not company_name or not section_name or not indicator or priority not in {1, 2, 3, 4}:
+            continue
+        if not period or amount is None or not unit:
+            continue
+        rows.append(
+            [
+                company_name,
+                section_name,
+                indicator,
+                priority,
+                period,
+                amount,
+                unit,
+            ]
+        )
+    return rows
+
+
 def _collect_metric_candidates(result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     metric_candidates_by_key: dict[str, list[dict[str, Any]]] = {}
     sources = [
@@ -718,6 +950,8 @@ def load_sheets_export_config(
         spreadsheet_id=_as_non_empty_str(raw_payload.get("spreadsheet_id")),
         spreadsheet_title=_as_non_empty_str(raw_payload.get("spreadsheet_title")) or "IFRS Parser Export",
         worksheet_name=_as_non_empty_str(raw_payload.get("worksheet_name")) or "Импорт",
+        bank_debt_worksheet_name=_as_non_empty_str(raw_payload.get("bank_debt_worksheet_name"))
+        or "Банк_долг_анализ",
         create_spreadsheet_if_missing=_to_bool(
             raw_payload.get("create_spreadsheet_if_missing"), default=True
         ),
@@ -831,6 +1065,23 @@ def _to_float(value: Any) -> float | None:
     return None
 
 
+def _to_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lstrip("-").isdigit():
+            try:
+                return int(text)
+            except ValueError:
+                return None
+    return None
+
+
 def _to_str_list(value: Any) -> list[str]:
     if isinstance(value, list):
         result: list[str] = []
@@ -896,6 +1147,38 @@ def _sheet_row_key(row: list[Any]) -> tuple[str, ...] | None:
         _normalize_lookup_text(_row_value(row, 9)),
     )
     return key
+
+
+def _bank_debt_row_key(row: list[Any]) -> tuple[str, ...] | None:
+    company = _normalize_lookup_text(_row_value(row, 1))
+    section = _normalize_lookup_text(_row_value(row, 2))
+    indicator = _normalize_lookup_text(_row_value(row, 3))
+    period = _normalize_lookup_text(_row_value(row, 5))
+    if not company or not section or not indicator or not period:
+        return None
+    return (
+        company,
+        section,
+        indicator,
+        period,
+    )
+
+
+def _bank_debt_rows_equal(existing_row: list[Any], candidate_row: list[Any]) -> bool:
+    for col_idx in range(1, 8):
+        if not _cell_values_equal(_row_value(existing_row, col_idx), _row_value(candidate_row, col_idx)):
+            return False
+    return True
+
+
+def _bank_debt_header_matches(first_row: list[Any]) -> bool:
+    if not first_row:
+        return False
+    for idx, expected in enumerate(BANK_DEBT_HEADERS, start=1):
+        actual = _row_value(first_row, idx)
+        if str(actual).strip() != expected:
+            return False
+    return True
 
 
 def _row_value(row: list[Any], col_idx: int) -> Any:

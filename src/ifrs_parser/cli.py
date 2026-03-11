@@ -7,15 +7,32 @@ from pathlib import Path
 
 from .metrics import load_metrics
 from .parser import GoogleIFRSPdfParser, IFRSParserConfig
-from .sheets_export import append_result_to_google_sheets
+from .sheets_export import (
+    append_bank_debt_result_to_google_sheets,
+    append_result_to_google_sheets,
+)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ifrs-parser",
-        description="Extract IFRS financial metrics from a PDF using Google AI API.",
+        description="Extract IFRS financial data using Google AI API.",
     )
-    parser.add_argument("--pdf", required=True, help="Path to IFRS PDF document.")
+    parser.add_argument(
+        "--mode",
+        choices=("metrics", "bank-debt-notes"),
+        default="metrics",
+        help="Parser mode: metrics (default) or bank-debt-notes.",
+    )
+    parser.add_argument("--pdf", help="Path to IFRS PDF document.")
+    parser.add_argument(
+        "--images-text-file",
+        help="Path to UTF-8 text file with OCR/image-extracted report text (optional fallback for mode=bank-debt-notes).",
+    )
+    parser.add_argument(
+        "--rep-year",
+        help="Optional year filter in YYYY (if omitted, period is detected from report).",
+    )
     parser.add_argument(
         "--out",
         default="output/ifrs_metrics.json",
@@ -71,8 +88,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_arg_parser().parse_args()
-
-    metrics = load_metrics(args.metrics_config)
     config = IFRSParserConfig(
         model=args.model,
         location=args.location,
@@ -85,33 +100,83 @@ def main() -> int:
         project=args.project,
         config=config,
     )
-    result = parser.extract_metrics(
-        pdf_path=args.pdf,
-        metrics=metrics,
-        period_hint=args.period_hint,
-    )
+
+    if args.mode == "metrics":
+        if not args.pdf:
+            raise ValueError("--pdf is required for mode=metrics.")
+        metrics = load_metrics(args.metrics_config)
+        result = parser.extract_metrics(
+            pdf_path=args.pdf,
+            metrics=metrics,
+            period_hint=args.period_hint,
+        )
+    else:
+        if args.pdf:
+            result = parser.extract_bank_debt_notes_from_pdf(
+                pdf_path=args.pdf,
+                rep_year=args.rep_year,
+                period_hint=args.period_hint,
+            )
+        elif args.images_text_file:
+            text_path = Path(args.images_text_file)
+            if not text_path.exists():
+                raise FileNotFoundError(f"images text file not found: {text_path}")
+            images_text = text_path.read_text(encoding="utf-8")
+            result = parser.extract_bank_debt_notes_from_images_text(
+                images_text=images_text,
+                rep_year=args.rep_year,
+            )
+        else:
+            raise ValueError(
+                "For mode=bank-debt-notes provide either --pdf or --images-text-file."
+            )
 
     output_path = Path(args.out)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    try:
-        sheets_summary = append_result_to_google_sheets(result, args.sheets_config)
-    except Exception as exc:
-        print(f"Warning: failed to append to Google Sheets: {exc}", file=sys.stderr)
+    if args.mode == "metrics":
+        try:
+            sheets_summary = append_result_to_google_sheets(result, args.sheets_config)
+        except Exception as exc:
+            print(f"Warning: failed to append to Google Sheets: {exc}", file=sys.stderr)
+        else:
+            if sheets_summary is not None:
+                status = sheets_summary.get("status")
+                if status == "ok":
+                    print(
+                        "Appended to Google Sheets: "
+                        f"{sheets_summary.get('spreadsheet_url')} "
+                        f"(rows: {sheets_summary.get('appended_rows')})"
+                    )
+                else:
+                    print(f"Google Sheets export status: {status}")
     else:
-        if sheets_summary is not None:
-            status = sheets_summary.get("status")
-            if status == "ok":
-                print(
-                    "Appended to Google Sheets: "
-                    f"{sheets_summary.get('spreadsheet_url')} "
-                    f"(rows: {sheets_summary.get('appended_rows')})"
-                )
-            else:
-                print(f"Google Sheets export status: {status}")
+        try:
+            sheets_summary = append_bank_debt_result_to_google_sheets(result, args.sheets_config)
+        except Exception as exc:
+            print(f"Warning: failed to append bank-debt result to Google Sheets: {exc}", file=sys.stderr)
+        else:
+            if sheets_summary is not None:
+                status = sheets_summary.get("status")
+                if status == "ok":
+                    print(
+                        "Appended bank-debt analysis to Google Sheets: "
+                        f"{sheets_summary.get('spreadsheet_url')} "
+                        f"(written: {sheets_summary.get('written_rows')})"
+                    )
+                else:
+                    print(f"Google Sheets bank-debt export status: {status}")
+        markdown_table = result.get("markdown_table")
+        if isinstance(markdown_table, str) and markdown_table.strip():
+            md_path = output_path.with_suffix(".md")
+            md_path.write_text(markdown_table, encoding="utf-8")
+            print(f"Saved markdown table to {md_path}")
 
-    print(f"Saved parsed metrics to {output_path}")
+    if args.mode == "metrics":
+        print(f"Saved parsed metrics to {output_path}")
+    else:
+        print(f"Saved bank-debt analysis to {output_path}")
     return 0
 
 

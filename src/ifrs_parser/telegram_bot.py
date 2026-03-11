@@ -19,7 +19,11 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 from .metrics import load_metrics
 from .parser import DEFAULT_LOCATION, DEFAULT_MODEL, GoogleIFRSPdfParser, IFRSParserConfig
-from .sheets_export import append_result_to_google_sheets, fetch_company_rows_from_google_sheets
+from .sheets_export import (
+    append_bank_debt_result_to_google_sheets,
+    append_result_to_google_sheets,
+    fetch_company_rows_from_google_sheets,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +32,8 @@ _TOKEN_LINE_RE = re.compile(r"^\s*TOKEN\s*=\s*(.+?)\s*$", re.IGNORECASE)
 DEFAULT_FEEDBACK_CHAT_ID = 780684269
 _AWAITING_FEEDBACK_KEY = "awaiting_feedback"
 DEFAULT_DOC_REGISTRY_PATH = Path("output/tg_doc_registry.json")
+MODE_METRICS = "metrics"
+MODE_BANK_DEBT_NOTES = "bank-debt-notes"
 _CSV_COLUMNS = [
     "source_document",
     "company_name",
@@ -49,6 +55,40 @@ _CSV_COLUMNS = [
     "confidence",
     "notes",
 ]
+_BANK_DEBT_CSV_COLUMNS = [
+    "Название компании",
+    "Номер и название раздела (Примечания, Приложения)",
+    "Показатель",
+    "Приоритет",
+    "Период",
+    "Сумма",
+    "Единица измерения",
+]
+
+
+def _is_transient_upstream_error(error_text: str) -> bool:
+    text = error_text.upper()
+    markers = (
+        "SERVER DISCONNECTED WITHOUT SENDING A RESPONSE",
+        "REMOTEPROTOCOLERROR",
+        "CONNECTTIMEOUT",
+        "READTIMEOUT",
+        "CONNECTION RESET",
+        "BROKEN PIPE",
+        "SERVICE UNAVAILABLE",
+        "GATEWAY TIMEOUT",
+        "BAD GATEWAY",
+        "INTERNAL SERVER ERROR",
+        "HTTP 500",
+        "HTTP 502",
+        "HTTP 503",
+        "HTTP 504",
+        "CODE: 500",
+        "CODE: 502",
+        "CODE: 503",
+        "CODE: 504",
+    )
+    return any(marker in text for marker in markers)
 
 
 def _as_non_empty_str(value: Any) -> str | None:
@@ -98,13 +138,23 @@ def _update_registry_after_parse(
     if not doc_key:
         return
 
+    company_name = _as_non_empty_str(result.get("company_name"))
+    if not company_name:
+        rows = result.get("rows")
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict):
+                    company_name = _as_non_empty_str(row.get("company_name"))
+                    if company_name:
+                        break
+
     path = _resolve_registry_path()
     payload = _load_registry(path)
     payload[doc_key] = {
         "file_name": _as_non_empty_str(getattr(document, "file_name", None)),
         "file_id": _as_non_empty_str(getattr(document, "file_id", None)),
         "file_unique_id": _as_non_empty_str(getattr(document, "file_unique_id", None)),
-        "company_name": _as_non_empty_str(result.get("company_name")),
+        "company_name": company_name,
         "reporting_period_end_date": _as_non_empty_str(result.get("reporting_period_end_date")),
         "sheets_status": _as_non_empty_str((sheets_summary or {}).get("status")),
         "spreadsheet_id": _as_non_empty_str((sheets_summary or {}).get("spreadsheet_id")),
@@ -196,6 +246,35 @@ def _extract_period_hint(caption: str | None) -> str | None:
     return text
 
 
+def _extract_rep_year(caption: str | None) -> str | None:
+    env_default = _as_non_empty_str(os.getenv("IFRS_REP_YEAR"))
+    text = (caption or "").strip()
+    if not text:
+        return env_default
+    patterns = [
+        r"(?:^|\s)rep_year\s*[:=]\s*(20\d{2})(?:\s|$)",
+        r"(?:^|\s)year\s*[:=]\s*(20\d{2})(?:\s|$)",
+        r"(?:^|\s)repyear\s*[:=]\s*(20\d{2})(?:\s|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return env_default
+
+
+def _resolve_parse_mode(caption: str | None) -> str:
+    env_mode = (_as_non_empty_str(os.getenv("IFRS_TG_PARSE_MODE")) or MODE_BANK_DEBT_NOTES).lower()
+    if env_mode not in {MODE_METRICS, MODE_BANK_DEBT_NOTES}:
+        env_mode = MODE_BANK_DEBT_NOTES
+    text = (caption or "").strip().lower()
+    if "mode=metrics" in text or "mode:metrics" in text:
+        return MODE_METRICS
+    if "mode=bank-debt-notes" in text or "mode:bank-debt-notes" in text:
+        return MODE_BANK_DEBT_NOTES
+    return env_mode
+
+
 def _safe_filename(filename: str | None) -> str:
     raw = (filename or "report.pdf").strip()
     if not raw:
@@ -208,8 +287,19 @@ def _safe_filename(filename: str | None) -> str:
     return sanitized
 
 
-def _parse_pdf_sync(pdf_path: Path, period_hint: str | None) -> dict[str, Any]:
+def _parse_pdf_sync(
+    pdf_path: Path,
+    period_hint: str | None,
+    parse_mode: str,
+    rep_year: str | None,
+) -> dict[str, Any]:
     parser = _build_parser()
+    if parse_mode == MODE_BANK_DEBT_NOTES:
+        return parser.extract_bank_debt_notes_from_pdf(
+            pdf_path=pdf_path,
+            rep_year=rep_year,
+            period_hint=period_hint,
+        )
     metrics = load_metrics()
     return parser.extract_metrics(
         pdf_path=pdf_path,
@@ -300,7 +390,38 @@ def _result_to_csv_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
-def _write_result_csv(result: dict[str, Any], csv_path: Path) -> None:
+def _result_to_bank_debt_csv_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_rows = result.get("rows")
+    if not isinstance(raw_rows, list):
+        return []
+    normalized_rows: list[dict[str, Any]] = []
+    for row in raw_rows:
+        if not isinstance(row, dict):
+            continue
+        normalized_rows.append(
+            {
+                "Название компании": row.get("company_name"),
+                "Номер и название раздела (Примечания, Приложения)": row.get("section_name"),
+                "Показатель": row.get("indicator"),
+                "Приоритет": row.get("priority"),
+                "Период": row.get("period"),
+                "Сумма": row.get("amount"),
+                "Единица измерения": row.get("unit"),
+            }
+        )
+    return normalized_rows
+
+
+def _write_result_csv(result: dict[str, Any], csv_path: Path, parse_mode: str) -> None:
+    if parse_mode == MODE_BANK_DEBT_NOTES:
+        rows = _result_to_bank_debt_csv_rows(result)
+        with csv_path.open("w", encoding="utf-8-sig", newline="") as output_file:
+            writer = csv.DictWriter(output_file, fieldnames=_BANK_DEBT_CSV_COLUMNS)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+        return
+
     rows = _result_to_csv_rows(result)
     with csv_path.open("w", encoding="utf-8-sig", newline="") as output_file:
         writer = csv.DictWriter(output_file, fieldnames=_CSV_COLUMNS)
@@ -309,7 +430,11 @@ def _write_result_csv(result: dict[str, Any], csv_path: Path) -> None:
             writer.writerow(row)
 
 
-def _build_done_caption(result: dict[str, Any]) -> str:
+def _build_done_caption(result: dict[str, Any], parse_mode: str) -> str:
+    if parse_mode == MODE_BANK_DEBT_NOTES:
+        row_count = result.get("row_count")
+        detected_period = result.get("detected_reporting_period") or result.get("effective_rep_year") or "не определен"
+        return f"Готово: найдено строк {row_count if isinstance(row_count, int) else 0}, период {detected_period}"
     company = result.get("company_name") or "Компания не определена"
     period = result.get("reporting_period_end_date") or result.get("reporting_period") or "Период не определен"
     return f"Готово: {company}, период {period}"
@@ -343,7 +468,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(
         "Привет! Я бот для парсинга МСФО PDF в CSV.\n"
         "Отправьте PDF-отчет документом, и я верну CSV с параметрами.\n"
-        "Опционально в подписи укажите period_hint=Q2 2025.\n"
+        "Период определяется автоматически из отчетности; опционально можно задать rep_year=2024.\n"
         "Если нужна помощь или хотите оставить обратную связь, используйте /help."
     )
 
@@ -355,8 +480,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         "Как пользоваться:\n"
         "1) Отправьте PDF файлом.\n"
-        "2) Можно добавить подпись: period_hint=Q2 2025.\n"
-        "3) Я верну CSV с извлеченными метриками.\n\n"
+        "2) Период определяется автоматически; при необходимости добавьте rep_year=2024.\n"
+        "3) Опционально добавьте period_hint=Q2 2025.\n"
+        "4) Я верну CSV с результатом.\n\n"
         "Обратная связь:\n"
         "Отправьте следующим сообщением текст обращения в одном из форматов:\n"
         "- Ошибка: <описание>\n"
@@ -375,6 +501,9 @@ async def handle_pdf_document(update: Update, context: ContextTypes.DEFAULT_TYPE
         await message.reply_text("Нужен PDF-файл.")
         return
 
+    parse_mode = _resolve_parse_mode(message.caption)
+    rep_year = _extract_rep_year(message.caption)
+
     temp_dir = Path(tempfile.mkdtemp(prefix="ifrs_tg_bot_"))
     display_filename = (document.file_name or "document.pdf").strip() or "document.pdf"
     status_message = await message.reply_text(
@@ -389,7 +518,7 @@ async def handle_pdf_document(update: Update, context: ContextTypes.DEFAULT_TYPE
             if isinstance(found_entry, dict):
                 cached_entry = found_entry
 
-        if cached_entry is not None:
+        if cached_entry is not None and parse_mode == MODE_METRICS:
             cached_company = _as_non_empty_str(cached_entry.get("company_name"))
             if cached_company:
                 await status_message.edit_text(
@@ -443,15 +572,22 @@ async def handle_pdf_document(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         period_hint = _extract_period_hint(message.caption)
         await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
-        result = await asyncio.to_thread(_parse_pdf_sync, pdf_path, period_hint)
+        result = await asyncio.to_thread(_parse_pdf_sync, pdf_path, period_hint, parse_mode, rep_year)
 
         sheets_summary: dict[str, Any] | None = None
         try:
-            sheets_summary = await asyncio.to_thread(
-                append_result_to_google_sheets,
-                result,
-                os.getenv("IFRS_SHEETS_CONFIG_PATH"),
-            )
+            if parse_mode == MODE_BANK_DEBT_NOTES:
+                sheets_summary = await asyncio.to_thread(
+                    append_bank_debt_result_to_google_sheets,
+                    result,
+                    os.getenv("IFRS_SHEETS_CONFIG_PATH"),
+                )
+            else:
+                sheets_summary = await asyncio.to_thread(
+                    append_result_to_google_sheets,
+                    result,
+                    os.getenv("IFRS_SHEETS_CONFIG_PATH"),
+                )
         except Exception as sheets_exc:
             logger.exception("Failed to append parsed result to Google Sheets")
             sheets_summary = {"status": "error", "error": str(sheets_exc)}
@@ -463,14 +599,15 @@ async def handle_pdf_document(update: Update, context: ContextTypes.DEFAULT_TYPE
             sheets_summary,
         )
 
-        csv_path = temp_dir / f"{pdf_path.stem}_metrics.csv"
-        await asyncio.to_thread(_write_result_csv, result, csv_path)
+        csv_suffix = "bank_debt_notes" if parse_mode == MODE_BANK_DEBT_NOTES else "metrics"
+        csv_path = temp_dir / f"{pdf_path.stem}_{csv_suffix}.csv"
+        await asyncio.to_thread(_write_result_csv, result, csv_path, parse_mode)
 
         await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
         with csv_path.open("rb") as csv_file:
             await message.reply_document(
                 document=InputFile(csv_file, filename=csv_path.name),
-                caption=_build_done_caption(result),
+                caption=_build_done_caption(result, parse_mode),
             )
         if sheets_summary and sheets_summary.get("status") == "ok":
             spreadsheet_url = sheets_summary.get("spreadsheet_url")
@@ -491,6 +628,12 @@ async def handle_pdf_document(update: Update, context: ContextTypes.DEFAULT_TYPE
             await status_message.edit_text(
                 "Временная перегрузка API (429 RESOURCE_EXHAUSTED). "
                 "Я уже сделал несколько автоматических попыток. Попробуйте отправить документ чуть позже."
+            )
+        elif _is_transient_upstream_error(error_text):
+            await status_message.edit_text(
+                "Временная сетевая ошибка при обращении к AI API. "
+                "Я сделал автоматические повторы, но запрос не завершился. "
+                "Повторите отправку PDF через 10-30 секунд."
             )
         else:
             await status_message.edit_text(f"Ошибка парсинга: {exc}")
@@ -550,7 +693,7 @@ async def handle_feedback_text(update: Update, context: ContextTypes.DEFAULT_TYP
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ifrs-telegram-bot",
-        description="Telegram bot that parses IFRS PDF and returns CSV metrics.",
+        description="Telegram bot that parses IFRS PDF and returns CSV output.",
     )
     parser.add_argument(
         "--token",

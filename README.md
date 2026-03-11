@@ -86,6 +86,7 @@ ifrs-parser \
 
 Optional parameters:
 
+- `--mode` (`metrics` or `bank-debt-notes`)
 - `--model` (default: `gemini-2.5-flash`)
 - `--period-hint` (example: `FY2025`)
 - `--timeout-sec` (default: `300`)
@@ -94,6 +95,39 @@ Optional parameters:
 - `--credentials-json` (service account key path for Vertex mode)
 - `--project` and `--location` (Vertex settings)
 - `--sheets-config` (path to Google Sheets export config)
+
+### Bank Debt Notes Mode (`PDF` or `images_text` + `rep_year`)
+
+For prompt logic focused on credit/loan notes from IFRS notes:
+
+PDF input:
+
+```bash
+ifrs-parser \
+  --mode bank-debt-notes \
+  --pdf /path/to/ifrs_report.pdf \
+  --credentials-json ./ifrs-parser-489510-ed0c01e3a0ca.json \
+  --project ifrs-parser-489510 \
+  --out output/bank_debt_notes_2024.json
+```
+
+OCR text fallback:
+
+```bash
+ifrs-parser \
+  --mode bank-debt-notes \
+  --images-text-file /path/to/images_text.txt \
+  --credentials-json ./ifrs-parser-489510-ed0c01e3a0ca.json \
+  --project ifrs-parser-489510 \
+  --out output/bank_debt_notes_2024.json
+```
+
+Output includes:
+
+- `rows` (normalized rows by company/section/indicator/priority/period/amount/unit)
+- `markdown_table` (single consolidated Markdown table for reporting)
+- Period is auto-detected from report (quarter/half-year/9M/year); optional override with `--rep-year 2024`.
+- In this mode rows are appended to a separate worksheet tab from `bank_debt_worksheet_name` in `config/sheets_export.json`.
 
 ## Google Sheets Export (one-pager format)
 

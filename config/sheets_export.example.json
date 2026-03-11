@@ -4,6 +4,7 @@
   "spreadsheet_id": "",
   "spreadsheet_title": "IFRS Parser Export",
   "worksheet_name": "Импорт",
+  "bank_debt_worksheet_name": "Банк_долг_анализ",
   "create_spreadsheet_if_missing": true,
   "share_with": [
     "your-email@company.com"

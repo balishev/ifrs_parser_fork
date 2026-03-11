@@ -26,6 +26,7 @@ Fill required fields:
 - `credentials_json`: absolute path to service-account JSON.
 - `spreadsheet_id`: keep empty to auto-create sheet on first init.
 - `worksheet_name`: target tab name.
+- `bank_debt_worksheet_name`: tab name for bank debt notes mode (`bank-debt-notes`).
 - `share_with`: emails that should get access to newly created sheet.
 - `ubo_by_company` (optional): mapping `company_name -> фамилия UBO` for reliable заполнение столбца `UBO`.
 - `ubo_unknown_value` (optional): fallback text if UBO is not found.

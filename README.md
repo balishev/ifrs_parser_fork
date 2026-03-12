@@ -87,6 +87,28 @@ ifrs-parser \
   --out output/bank_debt_notes.json
 ```
 
+## Как менять параметры парсинга
+
+Без изменения кода (CLI):
+
+- `--rep-year 2024`: жесткий фильтр по году.
+- `--period-hint "Q2 2025"`: подсказка модели по периоду.
+- `--model gemini-2.5-flash`: смена модели.
+- `--timeout-sec 600`: таймаут ожидания.
+- `--location us-central1`: регион Vertex.
+- `--keep-uploaded-file`: не удалять загруженный PDF в API.
+- `--sheets-config config/sheets_export.json`: запись результата в Google Sheets.
+
+Через изменение кода:
+
+- Промпт для PDF: [src/ifrs_parser/parser.py](/Users/artm/Desktop/ВТБ/ifrs_parser/src/ifrs_parser/parser.py:458) (`_build_bank_debt_pdf_prompt`).
+- Промпт для OCR-текста: [src/ifrs_parser/parser.py](/Users/artm/Desktop/ВТБ/ifrs_parser/src/ifrs_parser/parser.py:415) (`_build_bank_debt_prompt`).
+- Схема ответа (какие поля обязательны): [src/ifrs_parser/parser.py](/Users/artm/Desktop/ВТБ/ifrs_parser/src/ifrs_parser/parser.py:500) (`_build_bank_debt_response_schema`).
+- Нормализация и фильтрация периода: `_normalize_bank_debt_result`, `_extract_reporting_period_end_date`, `_period_matches_year` в [src/ifrs_parser/parser.py](/Users/artm/Desktop/ВТБ/ifrs_parser/src/ifrs_parser/parser.py).
+- Повторы при временных ошибках API: `IFRSParserConfig`, `_is_resource_exhausted_error`, `_is_transient_network_error` в [src/ifrs_parser/parser.py](/Users/artm/Desktop/ВТБ/ifrs_parser/src/ifrs_parser/parser.py:92).
+
+Если меняете слова/приоритеты (`банк`, `займ`, `заем`, `облигаци`), правьте их одновременно в промпте и, при необходимости, в пост-обработке, затем перезапускайте CLI/бота.
+
 ## Формат результата
 
 В выходном JSON:
@@ -154,6 +176,26 @@ IFRS_VERTEX_CREDENTIALS_JSON=ifrs-parser-489510-ed0c01e3a0ca.json \
 IFRS_VERTEX_PROJECT=ifrs-parser-489510 \
 python -m ifrs_parser.telegram_bot --token-file tg_token
 ```
+
+Настройка бота через переменные окружения:
+
+- `TELEGRAM_BOT_TOKEN`: токен бота (если не используете `--token-file`).
+- `TELEGRAM_BOT_TOKEN_FILE`: альтернативный путь до файла токена.
+- `IFRS_TG_PARSE_MODE`: режим по умолчанию (`bank-debt-notes` или `metrics`), если не задан в подписи.
+- `IFRS_REP_YEAR`: год по умолчанию для фильтра (если не задан в подписи).
+- `IFRS_SHEETS_CONFIG_PATH`: путь к конфигу выгрузки в Google Sheets.
+- `IFRS_FEEDBACK_CHAT_ID`: чат для обратной связи из `/help`.
+- `IFRS_TG_DOC_REGISTRY_PATH`: путь к локальному реестру уже обработанных PDF.
+- `IFRS_MODEL`: модель для парсинга.
+- `IFRS_TIMEOUT_SEC`: таймаут парсинга.
+- `GOOGLE_CLOUD_LOCATION`: регион Vertex.
+- `IFRS_VERTEX_CREDENTIALS_JSON`, `IFRS_VERTEX_PROJECT`: авторизация Vertex.
+
+Параметры в подписи к PDF (имеют приоритет над дефолтами):
+
+- `rep_year=2024`
+- `period_hint=Q2 2025`
+- `mode=bank-debt-notes` или `mode=metrics`
 
 Как использовать:
 

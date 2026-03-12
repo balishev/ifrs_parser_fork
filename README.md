@@ -1,62 +1,28 @@
-# IFRS PDF Parser (Google AI API)
+# IFRS Bank Debt Notes Parser
 
-This fork is focused on extracting bank debt / loans notes from IFRS PDF reports and exporting results to a dedicated Google Sheets tab.
+Проект для извлечения показателей по кредитам/займам из PDF отчетности МСФО.
 
-This project extracts a defined set of IFRS financial metrics from a PDF report using Google Gemini API.
+## Что делает проект
 
-## What it does
+- Принимает PDF отчетности МСФО.
+- Находит в Примечаниях/Приложениях разделы про кредиты, займы и долговые обязательства.
+- Извлекает строки по ключевым словам: `банк`, `займ`, `заем`, `облигаци`.
+- Назначает приоритет показателя:
+  - `1` если есть `займ`
+  - `2` если есть `банк`
+  - `3` если есть `заем`
+  - `4` если есть `облигаци`
+- Возвращает структурированный JSON и сводную Markdown-таблицу.
+- Может записывать результат в отдельный лист Google Sheets.
+- Может работать через Telegram-бота: PDF на вход, CSV на выход.
 
-- Input: IFRS PDF document.
-- Output: Structured JSON with requested financial metrics.
-- Engine: Google AI API (`google-genai` SDK).
-- Metric set: default list in code, or custom list from JSON config.
-- All numeric output values are converted to `RUB bn` (billions of rubles).
-- Latest period is returned in `metrics`, and previous comparable values are returned in `comparative_metrics`.
-- Additional calculated metrics are added to output based on parsed values.
+## Определение периода
 
-Also supported:
+- По умолчанию период определяется автоматически из отчетности (Q/H1/9M/FY).
+- Можно задать явный фильтр: `rep_year=2024`.
+- Если `rep_year` не указан, берется последний найденный отчетный период в документе.
 
-- `bank-debt-notes` mode for extracting rows from IFRS notes/applications related to loans and borrowings.
-- In `bank-debt-notes` mode, reporting period is auto-detected from the report (quarter/half-year/9M/year). `--rep-year` is optional override.
-- Export of bank-debt rows to a separate Google Sheets worksheet (`bank_debt_worksheet_name`).
-
-Default metric set:
-
-- Выручка (`revenue`)
-- Финансовые расходы (`interest_expense_loans`), приоритет:
-  1) процентные расходы по кредитам банков
-  2) если нет, процентные расходы
-  3) если нет, финансовые расходы
-- Амортизация (`depreciation`)
-- Денежные средства и эквиваленты (`cash_and_cash_equivalents`)
-- Основные средства (`property_plant_and_equipment`)
-- Операционная прибыль (`operating_profit`)
-- Долгосрочные обязательства: кредиты + лизинг (`long_term_debt_and_lease`)
-- Краткосрочные обязательства: кредиты + лизинг (`short_term_debt_and_lease`)
-
-Calculated metrics in output:
-
-- EBITDA = `operating_profit + depreciation`
-- EBITDA margin, % = `EBITDA / revenue * 100`
-- Total debt = `short_term_debt_and_lease + long_term_debt_and_lease`
-- Net debt = `total_debt - cash_and_cash_equivalents`
-- EBITDA / % expenses = `EBITDA / abs(interest_expense_loans)`
-- Net debt / EBITDA LTM
-
-## Requirements
-
-- Python 3.10+
-- One auth mode:
-  - Google API key with Gemini Developer API access, or
-  - Google service account JSON for Vertex AI
-
-Environment variable:
-
-```bash
-export GOOGLE_API_KEY="your_api_key"
-```
-
-## Install
+## Установка
 
 ```bash
 python3 -m venv .venv
@@ -64,290 +30,161 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-## Usage
+## Авторизация Google AI
+
+Поддерживаются 2 режима:
+
+- API key (`GOOGLE_API_KEY` или `GEMINI_API_KEY`)
+- Vertex AI service account (`IFRS_VERTEX_CREDENTIALS_JSON` + `IFRS_VERTEX_PROJECT`)
+
+Пример для Vertex:
 
 ```bash
-ifrs-parser \
-  --pdf /path/to/ifrs_report.pdf \
-  --out output/ifrs_metrics.json
+export IFRS_VERTEX_CREDENTIALS_JSON=ifrs-parser-489510-ed0c01e3a0ca.json
+export IFRS_VERTEX_PROJECT=ifrs-parser-489510
+export GOOGLE_CLOUD_LOCATION=us-central1
 ```
 
-With service account JSON (Vertex AI mode):
+## CLI: парсинг PDF долгов/кредитов
 
-```bash
-ifrs-parser \
-  --pdf /path/to/ifrs_report.pdf \
-  --credentials-json ./ifrs-parser-489510-ed0c01e3a0ca.json \
-  --project ifrs-parser-489510 \
-  --location us-central1 \
-  --out output/ifrs_metrics.json
-```
-
-With custom metrics config:
-
-```bash
-ifrs-parser \
-  --pdf /path/to/ifrs_report.pdf \
-  --metrics-config config/metrics.example.json \
-  --out output/custom_metrics.json
-```
-
-Optional parameters:
-
-- `--mode` (`metrics` or `bank-debt-notes`)
-- `--rep-year` (optional year override for `bank-debt-notes`, e.g. `2024`)
-- `--model` (default: `gemini-2.5-flash`)
-- `--period-hint` (example: `FY2025`)
-- `--timeout-sec` (default: `300`)
-- `--keep-uploaded-file` (do not delete uploaded file from Google API)
-- `--api-key` (if not using env var)
-- `--credentials-json` (service account key path for Vertex mode)
-- `--project` and `--location` (Vertex settings)
-- `--sheets-config` (path to Google Sheets export config)
-
-### Bank Debt Notes Mode (`PDF` or `images_text`)
-
-For prompt logic focused on credit/loan notes from IFRS notes:
-
-PDF input:
+Базовый запуск:
 
 ```bash
 ifrs-parser \
   --mode bank-debt-notes \
   --pdf /path/to/ifrs_report.pdf \
-  --credentials-json ./ifrs-parser-489510-ed0c01e3a0ca.json \
-  --project ifrs-parser-489510 \
   --out output/bank_debt_notes.json
 ```
 
-OCR text fallback:
-
-```bash
-ifrs-parser \
-  --mode bank-debt-notes \
-  --images-text-file /path/to/images_text.txt \
-  --credentials-json ./ifrs-parser-489510-ed0c01e3a0ca.json \
-  --project ifrs-parser-489510 \
-  --out output/bank_debt_notes.json
-```
-
-Optional explicit year filter:
+С указанием года:
 
 ```bash
 ifrs-parser \
   --mode bank-debt-notes \
   --pdf /path/to/ifrs_report.pdf \
   --rep-year 2024 \
-  --credentials-json ./ifrs-parser-489510-ed0c01e3a0ca.json \
-  --project ifrs-parser-489510 \
   --out output/bank_debt_notes_2024.json
 ```
 
-Output includes:
-
-- `rows` (normalized rows by company/section/indicator/priority/period/amount/unit)
-- `markdown_table` (single consolidated Markdown table for reporting)
-- Period is auto-detected from report (quarter/half-year/9M/year); optional override with `--rep-year 2024`.
-- In this mode rows are appended to a separate worksheet tab from `bank_debt_worksheet_name` in `config/sheets_export.json`.
-
-## Google Sheets Export (one-pager format)
-
-After parsing, result can be appended to Google Sheets in one-pager-like column format:
-
-- `Отрасль`, `UBO`, `Компания`, `Type`, `Показатель`, `Сегмент`, `Сегмент`, `Источник`, `Ед.изм.`, `LTM`, `2025`, `2024`, `2023`, `2022`
-- Period split inside year is supported:
-  - `3M` -> quarter columns (`1Q/2Q/3Q/4Q`)
-  - `6M` -> half-year columns (`1H/2H`)
-  - `9M` -> `3Q`
-  - `12M/FY` -> year columns (`2025/2024/...`)
-
-Setup:
-
-1. Copy config template:
-   ```bash
-   cp config/sheets_export.example.json config/sheets_export.json
-   ```
-2. Fill `credentials_json` and (optionally) `spreadsheet_id`.
-3. Initialize sheet:
-   ```bash
-   ifrs-sheets-init --config config/sheets_export.json
-   ```
-4. Use in parser:
-   ```bash
-   ifrs-parser --pdf /path/to/report.pdf --sheets-config config/sheets_export.json
-   ```
-
-Detailed auth/setup guide: [`docs/google_sheets_setup.md`](docs/google_sheets_setup.md)
-
-## HTTP API (async, with OpenAPI)
-
-Run API server:
+Через Vertex:
 
 ```bash
-ifrs-api
+ifrs-parser \
+  --mode bank-debt-notes \
+  --pdf /path/to/ifrs_report.pdf \
+  --credentials-json ./ifrs-parser-489510-ed0c01e3a0ca.json \
+  --project ifrs-parser-489510 \
+  --location us-central1 \
+  --out output/bank_debt_notes.json
 ```
 
-or:
+OCR fallback (если есть заранее извлеченный текст):
 
 ```bash
-uvicorn ifrs_parser.api:app --host 0.0.0.0 --port 8000
+ifrs-parser \
+  --mode bank-debt-notes \
+  --images-text-file /path/to/images_text.txt \
+  --out output/bank_debt_notes.json
 ```
 
-API docs (OpenAPI/Swagger):
+## Формат результата
 
-- `http://localhost:8000/docs`
-- `http://localhost:8000/openapi.json`
+В выходном JSON:
 
-Environment variables for auth/config:
+- `mode`: `bank_debt_notes`
+- `rows`: массив строк
+- `row_count`: количество строк
+- `markdown_table`: итоговая таблица
+- `detected_reporting_period`: найденный период
+- `detected_reporting_period_end_date`: конец периода (ISO)
+- `effective_rep_year`: фактически использованный год фильтра
 
-- `GOOGLE_API_KEY` or `GEMINI_API_KEY` for Gemini API key mode.
-- `IFRS_VERTEX_CREDENTIALS_JSON` + `IFRS_VERTEX_PROJECT` for Vertex mode.
-- `GOOGLE_CLOUD_LOCATION` (optional, default `us-central1`).
-- `IFRS_API_HOST` and `IFRS_API_PORT` for server bind settings.
+Поля каждой строки `rows`:
 
-Request example:
+- `company_name`
+- `section_name`
+- `indicator`
+- `priority`
+- `period`
+- `period_end_date`
+- `amount`
+- `unit`
+
+## Google Sheets (отдельный лист для долгов)
+
+1. Скопируйте шаблон конфига:
 
 ```bash
-curl -X POST "http://localhost:8000/parse" \
-  -F "file=@/path/to/ifrs_report.pdf" \
-  -F "period_hint=Q2 2025" \
-  -F "model=gemini-2.5-flash" \
-  -F "write_to_sheets=true"
+cp config/sheets_export.example.json config/sheets_export.json
 ```
 
-Response: same JSON structure as CLI output (`metrics`, `missing_metrics`, etc.).
+2. Заполните `config/sheets_export.json`:
 
-## Telegram Bot (async)
+- `credentials_json`
+- `spreadsheet_id` (если уже есть таблица)
+- `bank_debt_worksheet_name` (например: `Банк_долг_анализ`)
 
-Run bot:
+3. Инициализируйте таблицу:
 
 ```bash
-export TELEGRAM_BOT_TOKEN="your_telegram_bot_token"
-ifrs-telegram-bot
+ifrs-sheets-init --config config/sheets_export.json
 ```
 
-or:
+4. Запуск с записью в Sheets:
 
 ```bash
-ifrs-telegram-bot --token "your_telegram_bot_token"
+ifrs-parser \
+  --mode bank-debt-notes \
+  --pdf /path/to/ifrs_report.pdf \
+  --sheets-config config/sheets_export.json \
+  --out output/bank_debt_notes.json
 ```
 
-or via token file `tg_token`:
+Подробно: `docs/google_sheets_setup.md`.
+
+## Telegram-бот
+
+Запуск:
 
 ```bash
-echo 'TOKEN = your_telegram_bot_token' > tg_token
-ifrs-telegram-bot
+cd "/Users/artm/Desktop/ВТБ/ifrs_parser" && \
+PYTHONPATH=src \
+IFRS_SHEETS_CONFIG_PATH=config/sheets_export.json \
+IFRS_VERTEX_CREDENTIALS_JSON=ifrs-parser-489510-ed0c01e3a0ca.json \
+IFRS_VERTEX_PROJECT=ifrs-parser-489510 \
+python -m ifrs_parser.telegram_bot --token-file tg_token
 ```
 
-How it works:
+Как использовать:
 
-- Send IFRS PDF as a document to the bot.
-- Default parser mode is `bank-debt-notes` (can be overridden with caption `mode=metrics`).
-- Optional caption: `period_hint=Q2 2025`.
-- Optional caption year override: `rep_year=2024`.
-- Bot parses PDF and sends back CSV with extracted metrics.
-- If the same PDF was already processed before, bot skips parsing and sends company rows from Google Sheets.
-- `/start` sends a welcome message with usage.
-- `/help` asks user to leave feedback (`Ошибка`, `Изменение`, `Вопрос`) in the next text message.
-- Feedback is forwarded to support chat (default id: `780684269`).
+- Отправьте PDF документом.
+- Бот отправит статус: `Принял, анализирую ...`.
+- По завершении вернет CSV.
+- Для явного года добавьте в подпись: `rep_year=2024`.
+- Можно добавить `period_hint=Q2 2025`.
 
-Bot uses the same Google auth env vars as CLI/API:
+Команды:
 
-- `GOOGLE_API_KEY` or `GEMINI_API_KEY`, or
-- `IFRS_VERTEX_CREDENTIALS_JSON` + `IFRS_VERTEX_PROJECT`
-- Optional: `IFRS_FEEDBACK_CHAT_ID` to override default feedback chat id.
-- Optional: `IFRS_SHEETS_CONFIG_PATH` to auto-append parse result to Google Sheets.
-- Optional: `IFRS_TG_DOC_REGISTRY_PATH` to override local processed-doc registry path.
+- `/start` приветствие
+- `/help` режим обратной связи
 
-## Troubleshooting
+## CSV колонки бота (режим долгов)
 
-- `429 RESOURCE_EXHAUSTED` from Vertex/Gemini: parser retries automatically with backoff.
-- Temporary network/API transport failures (`Server disconnected without sending a response`, timeouts, 5xx): parser retries automatically.
-- If retries still fail, resend the PDF after 10-30 seconds.
+- `Название компании`
+- `Номер и название раздела (Примечания, Приложения)`
+- `Показатель`
+- `Приоритет`
+- `Период`
+- `Сумма`
+- `Единица измерения`
 
-## Metrics config format
+## Устойчивость к ошибкам
 
-JSON array of metric definitions:
+- При `429 RESOURCE_EXHAUSTED` применяются автоматические повторы с backoff.
+- При временных сетевых ошибках (`Server disconnected without sending a response`, timeout, 5xx) также выполняются автоповторы.
+- Если после ретраев ошибка сохраняется, повторите отправку через 10-30 секунд.
 
-```json
-[
-  {
-    "key": "revenue",
-    "name": "Выручка",
-    "description": "Revenue from IFRS statement of profit or loss."
-  }
-]
-```
+## Ограничения
 
-Rules:
-
-- `key`: lowercase letters, digits, underscore only (for example `property_plant_and_equipment`).
-- Keys must be unique.
-
-## Output format
-
-Output is a JSON object like:
-
-```json
-{
-  "source_document": "report.pdf",
-  "model": "gemini-2.5-flash",
-  "company_name": "Example PLC",
-  "ubo_surname": "Иванов",
-  "reporting_period": "FY2025",
-  "reporting_period_end_date": "2025-12-31",
-  "reporting_currency": "RUB",
-  "output_value_unit": "RUB bn",
-  "notes": null,
-  "metrics": [
-    {
-      "metric_key": "revenue",
-      "metric_name": "Revenue",
-      "found": true,
-      "value": 123.456,
-      "unit": "RUB bn",
-      "scale_multiplier": 1.0,
-      "period_label": "2025",
-      "period_end_date": "2025-12-31",
-      "selection_level": "bank_loan_interest",
-      "statement": "Statement of profit or loss",
-      "page": 45,
-      "evidence": "Revenue 123,456",
-      "confidence": 0.89,
-      "notes": null
-    }
-  ],
-  "comparative_metrics": [
-    {
-      "metric_key": "revenue",
-      "metric_name": "Revenue",
-      "found": true,
-      "value": 118.001,
-      "unit": "RUB bn",
-      "scale_multiplier": 1.0,
-      "period_label": "6M 2024",
-      "period_end_date": "2024-06-30",
-      "selection_level": "bank_loan_interest",
-      "statement": "Statement of profit or loss",
-      "page": 45,
-      "evidence": "Revenue 118,001",
-      "confidence": 0.86,
-      "notes": null
-    }
-  ],
-  "missing_metrics": []
-}
-```
-
-`missing_metrics` contains metric keys that were not found.
-
-`ubo_surname` is extracted when UBO/ultimate controlling party is explicitly disclosed in report text.
-
-Business rule:
-
-- If `depreciation` is not found, parser estimates it as `10%` of `property_plant_and_equipment`.
-
-## Notes about PDF size
-
-- API key mode uses Files API and supports larger PDFs.
-- Vertex mode uses inline PDF payload in this implementation and has a size limit of `19 MB`.
+- В Vertex-режиме inline PDF ограничен размером около `19 MB`.
+- Для больших PDF предпочтителен режим с API key (Files API).
